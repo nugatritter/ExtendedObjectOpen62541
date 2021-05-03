@@ -1,3 +1,9 @@
+/*************************************************************************\
+* Copyright (c) 2021 HZB.
+* Author: Carsten Winkler carsten.winkler@helmholtz-berlin.de
+\*************************************************************************/
+
+
 #include <open62541/client_config_default.h>
 #include <open62541/client_highlevel.h>
 #include <open62541/plugin/log_stdout.h>

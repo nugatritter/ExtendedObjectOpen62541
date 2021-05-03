@@ -1,3 +1,8 @@
+/*************************************************************************\
+* Copyright (c) 2021 HZB.
+* Author: Carsten Winkler carsten.winkler@helmholtz-berlin.de
+\*************************************************************************/
+
 #pragma once
 #define EXO_USER_DICIONARIES_ONLY // optimised dictionary processing
 #define ADDRESS_SIZE 8 // used for padding calculation
