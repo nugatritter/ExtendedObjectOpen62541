@@ -1244,7 +1244,7 @@ UA_Byte calc_struct_padding(std::vector<const UA_DataType*>* structMemberTypes, 
 }
 
 int main(int argc, char* argv[]) {   
-    const char uaUrl[] = "opc.tcp://firing2:48010";//"opc.tcp://127.0.0.1:62541/milo";//"opc.tcp://milo.digitalpetri.com:62541/milo";//
+    const char* uaUrl = "opc.tcp://firing2:48010";//"opc.tcp://127.0.0.1:62541/milo";//"opc.tcp://milo.digitalpetri.com:62541/milo";//
     const UA_UInt16 numberOfIds = 7;
     const char id[numberOfIds][255] = { "Demo.Static.Scalar.CarExtras", "Demo.BoilerDemo.Boiler1.HeaterStatus", "Demo.Static.Scalar.OptionSet", "Demo.Static.Scalar.XmlElement", "Demo.Static.Scalar.Structure", "Demo.Static.Scalar.Union", "Demo.Static.Scalar.Structures.AnalogMeasurement" };//"ComplexTypes/CustomStructTypeVariable";//"ComplexTypes/CustomUnionTypeVariable";//"Person1";//"Demo.Static.Scalar.Priority";//"ComplexTypes/CustomEnumTypeVariable";//
     UA_NodeId nodeId;
@@ -1256,6 +1256,8 @@ int main(int argc, char* argv[]) {
     std::map<std::string, UA_Variant> structureMembers;
     std::map<UA_UInt32, std::string> dictionaries;
     std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>> dataTypeAttributes;
+
+    if (argc > 1) uaUrl = argv[1];
 
     // pre-initialisation of the user data type
     userDataType.memSize = 0;
