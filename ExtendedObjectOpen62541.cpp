@@ -18,6 +18,7 @@
 #include <map>
 #include <vector>
 #include <string>
+#include <cmath>
 
 #include "TailQueue.h"
 #include "ExtendedObjectOpen62541.h"
@@ -162,7 +163,7 @@ void buildUserDataType(UA_DataTypeKind userDataTypeKind, std::vector<const UA_Da
 
 // helper function to print binary values
 void binary_print(UA_Byte value) {
-    printf_s("%c%c%c%c %c%c%c%c %c%c%c%c %c%c%c%c", value & 0x8000 ? '1' : '0', value & 0x4000 ? '1' : '0', value & 0x2000 ? '1' : '0', value & 0x1000 ? '1' : '0',
+    printf("%c%c%c%c %c%c%c%c %c%c%c%c %c%c%c%c", value & 0x8000 ? '1' : '0', value & 0x4000 ? '1' : '0', value & 0x2000 ? '1' : '0', value & 0x1000 ? '1' : '0',
         value & 0x0800 ? '1' : '0', value & 0x0400 ? '1' : '0', value & 0x0200 ? '1' : '0', value & 0x0100 ? '1' : '0',
         value & 0x0080 ? '1' : '0', value & 0x0040 ? '1' : '0', value & 0x0020 ? '1' : '0', value & 0x0010 ? '1' : '0',
         value & 0x0008 ? '1' : '0', value & 0x0004 ? '1' : '0', value & 0x0002 ? '1' : '0', value & 0x0001 ? '1' : '0');
@@ -196,7 +197,7 @@ char* byteStringToString(UA_ByteString* bytes) {
         return NULL;
     size_t bufferSize = bytes->length;
     char* str = new char[bufferSize + 1];
-    memcpy_s(str, bufferSize, bytes->data, bufferSize);
+    memcpy(str, bytes->data, bufferSize);
     *(str + bufferSize) = 0x0;
     return str;
 }
@@ -584,23 +585,23 @@ UA_StatusCode getStructureValues(UA_Client* client, UA_Variant structVal, UA_Dat
                 it++;
                 validBits = &it->second;
                 pValue = ((UA_ByteString*)value->data)->data;
-                /*printf_s("%-25s: ", "value");
+                /*printf("%-25s: ", "value");
                 binary_print(*pValue);
-                printf_s(" (%d)\n", *pValue);*/
+                printf(" (%d)\n", *pValue);*/
                 pValidBits = ((UA_ByteString*)validBits->data)->data;
-               /* printf_s("%-25s: ", "valid bits");
+               /* printf("%-25s: ", "valid bits");
                 binary_print(*pValidBits);
-                printf_s(" (%d)\n", *pValidBits);*/
+                printf(" (%d)\n", *pValidBits);*/
                 resultingBits = *pValue & *pValidBits;
-                /*printf_s("%-25s: ", "result");
+                /*printf("%-25s: ", "result");
                 binary_print(resultingBits);
-                printf_s(" (%d)\n", resultingBits);*/
+                printf(" (%d)\n", resultingBits);*/
                 retval = browseNodeId(client, userDataType->typeId, &bResp1);
                 if (retval == UA_STATUSCODE_GOOD) {
                     getPropertyDescription(client, &bResp1, &propertySet);
                     structureMembers->clear();
                     for (propertySetIt = propertySet.begin(); propertySetIt != propertySet.end(); ++propertySetIt) {
-                        //printf_s("%-25s: %s\n", propertySetIt->c_str(), (resultingBits & 0x01 << pos) ? "TRUE" : "FALSE");
+                        //printf("%-25s: %s\n", propertySetIt->c_str(), (resultingBits & 0x01 << pos) ? "TRUE" : "FALSE");
                         UA_Variant varVal;
                         UA_Variant_init(&varVal);
                         variantContent = UA_Boolean_new();
@@ -689,7 +690,7 @@ UA_StatusCode getUserDataTypeAttributes(UA_Client* client, UA_NodeId pvId, std::
         char warn[256];
         UA_String out;
         UA_print(&dataTypeId, &UA_TYPES[UA_TYPES_NODEID], &out);
-        sprintf_s(warn, "has no user data type (Node ID of data type is %.*s)", (UA_UInt16)out.length, out.data);
+        sprintf(warn, "has no user data type (Node ID of data type is %.*s)", (UA_UInt16)out.length, out.data);
         printWarn(warn, pvId);
         UA_String_clear(&out);
         UA_QualifiedName_clear(&browseName);
@@ -1243,7 +1244,7 @@ UA_Byte calc_struct_padding(std::vector<const UA_DataType*>* structMemberTypes, 
 }
 
 int main(int argc, char* argv[]) {   
-    const char uaUrl[] = "opc.tcp://firing2:48010";//"opc.tcp://127.0.0.1:62541/milo";//"opc.tcp://milo.digitalpetri.com:62541/milo";//
+    const char* uaUrl = "opc.tcp://firing2:48010";//"opc.tcp://127.0.0.1:62541/milo";//"opc.tcp://milo.digitalpetri.com:62541/milo";//
     const UA_UInt16 numberOfIds = 7;
     const char id[numberOfIds][255] = { "Demo.Static.Scalar.CarExtras", "Demo.BoilerDemo.Boiler1.HeaterStatus", "Demo.Static.Scalar.OptionSet", "Demo.Static.Scalar.XmlElement", "Demo.Static.Scalar.Structure", "Demo.Static.Scalar.Union", "Demo.Static.Scalar.Structures.AnalogMeasurement" };//"ComplexTypes/CustomStructTypeVariable";//"ComplexTypes/CustomUnionTypeVariable";//"Person1";//"Demo.Static.Scalar.Priority";//"ComplexTypes/CustomEnumTypeVariable";//
     UA_NodeId nodeId;
@@ -1255,6 +1256,8 @@ int main(int argc, char* argv[]) {
     std::map<std::string, UA_Variant> structureMembers;
     std::map<UA_UInt32, std::string> dictionaries;
     std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>> dataTypeAttributes;
+
+    if (argc > 1) uaUrl = argv[1];
 
     // pre-initialisation of the user data type
     userDataType.memSize = 0;
