@@ -3,7 +3,6 @@
 * Author: Carsten Winkler carsten.winkler@helmholtz-berlin.de
 \*************************************************************************/
 
-
 #include <open62541/client_config_default.h>
 #include <open62541/client_highlevel.h>
 #include <open62541/plugin/log_stdout.h>
@@ -15,10 +14,11 @@
 #include <libxml/tree.h>
 #include <libxml/xpath.h>
 
-#include <map>
-#include <vector>
-#include <string>
+#include <algorithm>
 #include <cmath>
+#include <map>
+#include <string>
+#include <vector>
 
 #include "TailQueue.h"
 #include "ExtendedObjectOpen62541.h"
@@ -33,12 +33,11 @@ UA_Byte calc_struct_padding(std::vector<const UA_DataType*>* structMemberTypes, 
 // retrieves the binary encoding ID of a data type
 // returns true if the binary ID could be retrieved
 UA_StatusCode getBinaryEncodingId(UA_Client* client, UA_NodeId pvId, UA_NodeId* binaryEncodingId);
-// checks whether the data type is an enumeration
-UA_Boolean isEnum(UA_NodeId dataTypeId, std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>* dataTypeAttributes);
 // checks whether the xml node is a leaf (child)
 UA_Boolean isLeaf(xmlNode* node);
 // shortcut for warning message; the node ID is printed before the message
 void printWarn(const char* message, UA_NodeId pvId);
+void UA_printNodeClass(UA_NodeClass nodeClass, UA_String* out);
 
 // converts dictionary data type tag to OPC data type address (generated open62541 data types)
 const UA_DataType* parseDataType(std::string text) {
@@ -49,6 +48,8 @@ const UA_DataType* parseDataType(std::string text) {
     if (xmlStrncasecmp((const xmlChar*)("opc:SByte"), (xmlChar*)text.data(), (UA_UInt32)text.length()) == 0)
         return &(UA_TYPES[UA_TYPES_SBYTE]);
     if (xmlStrncasecmp((const xmlChar*)("opc:Boolean"), (xmlChar*)text.data(), (UA_UInt32)text.length()) == 0)
+        return &(UA_TYPES[UA_TYPES_BOOLEAN]);
+    if (xmlStrncasecmp((const xmlChar*)("opc:Bit"), (xmlChar*)text.data(), (UA_UInt32)text.length()) == 0)
         return &(UA_TYPES[UA_TYPES_BOOLEAN]);
     if (xmlStrncasecmp((const xmlChar*)("opc:Int16"), (xmlChar*)text.data(), (UA_UInt32)text.length()) == 0)
         return &(UA_TYPES[UA_TYPES_INT16]);
@@ -95,72 +96,6 @@ const UA_DataType* parseDataType(std::string text) {
     return NULL;
 }
 
-// creates user data type from data type structure
-// this is a sub function of getUserDataType
-void buildUserDataType(UA_DataTypeKind userDataTypeKind, std::vector<const UA_DataType*>* structMemberTypes, UA_DataType* userDataType) {
-    std::vector<const UA_DataType*> enumMemberTypes; 
-    std::vector<UA_Byte> paddings;
-    std::vector<UA_Byte>::iterator padding;
-    std::vector<const UA_DataType*>::iterator structMemberType;
-    UA_DataTypeMember* userDataTypeMembers = 0x0;
-    UA_Byte index = 0;
-    UA_Byte size = 0;
-    UA_Boolean pointerFree = UA_TRUE;
-    structMemberType = structMemberTypes->begin();
-    if (structMemberType == structMemberTypes->end())
-        return;
-    if (userDataTypeKind == UA_DATATYPEKIND_UNION) {
-        enumMemberTypes.push_back(*structMemberType);
-        enumMemberTypes.push_back(*std::prev(structMemberTypes->end()));
-        size = calc_struct_padding(&enumMemberTypes, &paddings);
-        if (enumMemberTypes.size() != paddings.size()) // result is corrupt
-            return;
-        userDataTypeMembers = (UA_DataTypeMember*)UA_malloc((UA_UInt16)enumMemberTypes.size() * sizeof(UA_DataTypeMember));
-        memset(userDataTypeMembers, 0x0, (UA_UInt16)enumMemberTypes.size() * sizeof(UA_DataTypeMember));
-        structMemberType = enumMemberTypes.begin();
-    }
-    else {
-        size = calc_struct_padding(structMemberTypes, &paddings);
-        if (structMemberTypes->size() != paddings.size()) // result is corrupt
-            return;
-        userDataTypeMembers = (UA_DataTypeMember*)UA_malloc(structMemberTypes->size() * sizeof(UA_DataTypeMember));
-        memset(userDataTypeMembers, 0x0, structMemberTypes->size() * sizeof(UA_DataTypeMember));
-    }
-    padding = paddings.begin();
-    while (padding != paddings.end()) {
-        userDataTypeMembers[index].isArray = UA_FALSE;
-        userDataTypeMembers[index].isOptional = UA_FALSE;
-        userDataTypeMembers[index].memberTypeIndex = (*structMemberType)->typeIndex;
-        if (userDataTypeMembers[index].memberTypeIndex > UA_TYPES_DOUBLE)
-            pointerFree = UA_FALSE;
-        userDataTypeMembers[index].namespaceZero = (*structMemberType)->typeId.namespaceIndex == 0 ? UA_TRUE : UA_FALSE;
-        userDataTypeMembers[index].padding = *padding;
-#ifdef UA_ENABLE_TYPEDESCRIPTION
-        size_t length = strlen((*structMemberType)->typeName);
-        userDataTypeMembers[index].memberName = (char*)UA_malloc((length + 1) * sizeof(char));
-        strncpy((char*)userDataTypeMembers[index].memberName, (*structMemberType)->typeName, length);
-        ((char*)userDataTypeMembers[index].memberName)[length] = 0x0;
-        //UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%-10s has a size of %2d bytes, a padding of %2d bytes and a resulting memory consumption of %2d bytes", (*structMemberType)->typeName, (*structMemberType)->memSize, *padding, (*structMemberType)->memSize + *padding);
-#endif
-        index++;
-        padding++;
-        structMemberType++;
-    }
-    userDataType->membersSize = index;
-    userDataType->members = userDataTypeMembers;
-    if (userDataTypeKind == UA_DATATYPEKIND_UNION)
-        userDataType->memSize = size;
-    else
-        userDataType->memSize = size;
-    userDataType->pointerFree = pointerFree;
-    userDataType->overlayable = UA_FALSE;
-    userDataType->typeKind = userDataTypeKind;
-    userDataType->typeIndex = UA_TYPES_EXTENSIONOBJECT;
-//#ifdef UA_ENABLE_TYPEDESCRIPTION
-//    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%-10s has a size of %d bytes", userDataType->typeName, userDataType->memSize, size);
-//#endif
-}
-
 // helper function to print binary values
 void binary_print(UA_Byte value) {
     printf("%c%c%c%c %c%c%c%c %c%c%c%c %c%c%c%c", value & 0x8000 ? '1' : '0', value & 0x4000 ? '1' : '0', value & 0x2000 ? '1' : '0', value & 0x1000 ? '1' : '0',
@@ -184,7 +119,7 @@ UA_StatusCode browseNodeId(UA_Client* client, UA_NodeId nodeId, UA_BrowseRespons
     bReq.nodesToBrowseSize = 1;
     UA_NodeId_copy(&nodeId, &bReq.nodesToBrowse[0].nodeId);
     bReq.nodesToBrowse[0].resultMask = UA_BROWSERESULTMASK_ALL; /* return everything */
-    bReq.nodesToBrowse[0].browseDirection = UA_BROWSEDIRECTION_BOTH;
+    bReq.nodesToBrowse[0].browseDirection = UA_BROWSEDIRECTION_FORWARD;
     *bResp = UA_Client_Service_browse(client, bReq);
     UA_BrowseRequest_clear(&bReq);
     return UA_STATUSCODE_GOOD;
@@ -281,9 +216,9 @@ UA_Boolean findBrowseName(xmlNode* node, UA_String browseName, xmlNode** result)
 
 // this function collects all properties of a xml node
 void collectProperties(xmlNode* node, std::vector<std::map<std::string, std::string>>* vec, UA_Boolean isParent) {
-    if(!node || !vec || vec->begin() == vec->end())
+    if (!node || !vec || vec->empty())
         return;
-    _xmlAttr* attr; 
+    _xmlAttr* attr;
     if (isParent) {
         std::map<std::string, std::string>* map;
         map = &(*vec->begin());
@@ -299,6 +234,11 @@ void collectProperties(xmlNode* node, std::vector<std::map<std::string, std::str
         else {
             map->insert(std::pair<std::string, std::string>(std::string(EXO_DATATYPE_NS0ID), std::string("0")));
         }
+        xmlChar* value = xmlGetProp(node, BAD_CAST"EXO_BASEDATATYPE");
+        if (value)
+            map->insert(std::pair<std::string, std::string>(EXO_BASEDATATYPE, std::string((char*)value)));
+        else
+            map->insert(std::pair<std::string, std::string>(EXO_BASEDATATYPE, std::string("")));
         return;
     }
     while (node) {
@@ -315,167 +255,6 @@ void collectProperties(xmlNode* node, std::vector<std::map<std::string, std::str
             vec->push_back(map);
         }
         node = node->next;
-    }
-}
-
-// this function builds data attributes and user data type of given node ID
-// returns RAM size of user data type
-UA_UInt16 getUserDataType(UA_Client* client, UA_NodeId nodeId, std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>* dataTypeAttributes, UA_DataType* userDataType) {
-    UA_StatusCode retval = UA_STATUSCODE_BAD;
-    UA_UInt16 memSize = 0;
-    UA_NodeId binaryEncodingId;
-    UA_DataTypeKind userDataTypeKind;
-    UA_UInt16 lengthInBits = 0;    
-    std::vector<const UA_DataType*> structMemberTypes;
-    std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>::iterator dataTypeAttribute;
-    std::vector<std::map<std::string, std::string>>::iterator dataTypeAttributePropertySegment;
-    std::map<std::string, std::string>::iterator dataTypeAttributeProperty;
-    retval = getBinaryEncodingId(client, nodeId, &binaryEncodingId);
-    if (retval == UA_STATUSCODE_GOOD)
-        UA_NodeId_copy(&binaryEncodingId, &userDataType->binaryEncodingId);
-    else
-        UA_NodeId_init(&binaryEncodingId);
-    dataTypeAttribute = dataTypeAttributes->find(UA_NodeId_hash(&userDataType->typeId));
-    if (dataTypeAttribute == dataTypeAttributes->end()) {
-        printWarn("has inknown data type", nodeId);
-        return 0;
-    }
-    dataTypeAttributePropertySegment = dataTypeAttribute->second.begin();
-    if (dataTypeAttributePropertySegment == dataTypeAttribute->second.end()) {
-        printWarn("has inknown data type", nodeId);
-        return 0;
-    }
-    dataTypeAttributeProperty = dataTypeAttributePropertySegment->find(EXO_DATATYPE_NS0ID);
-    if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end() || dataTypeAttributeProperty->first.empty() || dataTypeAttributeProperty->second.empty()) {
-        printWarn("has inknown data type", nodeId);
-        return 0;
-    }
-    dataTypeAttributePropertySegment++;
-    if(dataTypeAttributePropertySegment != dataTypeAttribute->second.end()) {
-        switch (std::stoul(dataTypeAttributeProperty->second)) {
-        case UA_NS0ID_STRUCTUREDEFINITION: {
-            std::string name;
-            std::string parentName;
-            std::string switchField;
-            const UA_DataType* dataType = 0x0;
-            const UA_DataType* maxDataType = 0x0;
-            UA_UInt16 value = 0;
-            UA_UInt16 switchValue = 0;
-            userDataTypeKind = UA_DATATYPEKIND_STRUCTURE;
-            while (dataTypeAttributePropertySegment != dataTypeAttribute->second.end()) {
-                name.clear();
-                switchField.clear();
-                dataType = 0x0;
-                value = 0;
-                switchValue = 0;
-                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find(EXO_DATANAME);
-                if (dataTypeAttributeProperty != dataTypeAttributePropertySegment->end()) {
-                    name = std::string(dataTypeAttributeProperty->second);
-                    if (parentName.empty())
-                        parentName = std::string(dataTypeAttributeProperty->second);
-                }
-                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find("TypeName");
-                if (dataTypeAttributeProperty != dataTypeAttributePropertySegment->end()) {
-                    dataType = parseDataType(dataTypeAttributeProperty->second);
-                }
-                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find("Value");
-                if (dataTypeAttributeProperty != dataTypeAttributePropertySegment->end()) {
-                    value = std::stoi(dataTypeAttributeProperty->second);
-                }
-                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find("SwitchValue");
-                if (dataTypeAttributeProperty != dataTypeAttributePropertySegment->end()) {
-                    switchValue = std::stoi(dataTypeAttributeProperty->second);
-                }
-                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find("SwitchField");
-                if (dataTypeAttributeProperty != dataTypeAttributePropertySegment->end()) {
-                    switchField = std::string(dataTypeAttributeProperty->second);
-                    userDataTypeKind = UA_DATATYPEKIND_UNION;
-                }
-                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find("LengthInBits");
-                if (dataTypeAttributeProperty != dataTypeAttributePropertySegment->end()) {
-                    lengthInBits = std::stoi(dataTypeAttributeProperty->second);
-                }
-                if (dataType) {
-                    if (!switchField.empty() && !parentName.empty() && switchField.compare(parentName) == 0) {
-                        if (!maxDataType)
-                            maxDataType = dataType;
-                        else if (maxDataType->memSize < dataType->memSize)
-                            maxDataType = dataType;
-                    }
-                    structMemberTypes.push_back(dataType);
-                }
-                dataTypeAttributePropertySegment++;
-            };
-            if (userDataTypeKind == UA_DATATYPEKIND_UNION && maxDataType)
-                structMemberTypes.push_back(maxDataType);
-            break;
-        }
-        case UA_NS0ID_ENUMDEFINITION: {
-            printWarn("is an enumeration and no user data type", nodeId);
-            return 0;
-        }
-        default: {
-            printWarn("has unsupported data type (1)", nodeId);
-            return 0;
-        }
-        }
-    }
-    if (structMemberTypes.size() == 0) {
-        printWarn("has unsupported data type (2)", nodeId);
-    }
-    else {
-        buildUserDataType(userDataTypeKind, &structMemberTypes, userDataType);
-        if (userDataType)
-            memSize = userDataType->memSize;
-        else
-            printWarn("has unsupported data type (3)", nodeId);
-    }
-    if (lengthInBits && lengthInBits != memSize) {
-        printWarn("data type has corrupt memory size", nodeId);
-        return 0;
-    }
-    return memSize;
-}
-
-// retrieves the property set from a OPC UA browse response
-// use the function browseNodeId to get the parameter UA_BrowseResponse* bResp
-void getPropertyDescription(UA_Client* client, UA_BrowseResponse* bResp, std::vector<std::string>* propertySet) {
-    UA_ReferenceDescription rDesc;
-    for (size_t i = 0; i < bResp->resultsSize; ++i) {
-        for (size_t j = 0; j < bResp->results[i].referencesSize; ++j) {
-            rDesc = bResp->results[i].references[j];
-            if (rDesc.referenceTypeId.identifierType == UA_NODEIDTYPE_NUMERIC && rDesc.referenceTypeId.identifier.numeric == UA_NS0ID_HASPROPERTY) {
-                UA_Variant outValue;
-                UA_Client_readValueAttribute(client, rDesc.nodeId.nodeId, &outValue);
-                if (!UA_Variant_isScalar(&outValue)) {
-                    if (outValue.type->typeId.namespaceIndex == 0 && outValue.type->typeId.identifierType == UA_NODEIDTYPE_NUMERIC && outValue.type->typeId.identifier.numeric == UA_NS0ID_LOCALIZEDTEXT) {
-                        UA_LocalizedText* data = (UA_LocalizedText*)outValue.data;
-                        uintptr_t target = (uintptr_t)outValue.arrayDimensions;
-                        for (UA_UInt32 i = 0; i < (UA_UInt32)outValue.arrayLength; i++) {                           
-                            propertySet->push_back(std::string((char*)data[i].text.data, data[i].text.length));
-                        }
-                    }
-                }
-                UA_Variant_clear(&outValue);
-            }
-        }
-    }
-}
-
-// retrieves the attributes of a node ID (hash value)
-void getAttributes(xmlNode* node, UA_UInt32 typeHash, std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>* dataTypeAttributes) {
-    if (!node)
-        return;
-    std::vector<std::map<std::string, std::string>> vec;
-    std::map<std::string, std::string> map;
-    xmlChar* parentName = xmlGetProp(node, (const xmlChar*)("Name"));
-    if (parentName) {
-        map.insert(std::pair<std::string, std::string>(std::string(EXO_DATANAME), std::string((char*)parentName)));
-        vec.push_back(map);
-        collectProperties(node, &vec, UA_TRUE);
-        collectProperties(node->children, &vec, UA_FALSE);
-        auto pair = std::pair<UA_UInt32, std::vector<std::map<std::string, std::string>>>(typeHash, vec);
-        dataTypeAttributes->insert(pair);
     }
 }
 
@@ -506,135 +285,6 @@ UA_StatusCode getBinaryEncodingId(UA_Client* client, UA_NodeId pvId, UA_NodeId* 
     return retval;
 }
 
-// retrieves all member names of a structure of a user data type
-// this is a sub function of getStructureValues
-void getStructureFieldNames(UA_DataType* userDataType, std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>* dataTypeAttributes, std::vector<std::string>* fieldNames) {
-    UA_UInt16 foundCount = 0;
-    std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>::iterator dataTypeAttribute;
-    std::vector<std::map<std::string, std::string>>::iterator dataTypeAttributePropertySegment;
-    std::map<std::string, std::string>::iterator dataTypeAttributeProperty;
-    std::vector<std::map<std::string, std::string>> attribues;
-    for (dataTypeAttribute = dataTypeAttributes->begin(); dataTypeAttribute != dataTypeAttributes->end(); ++dataTypeAttribute) {
-        if (dataTypeAttribute->first == UA_NodeId_hash(&userDataType->typeId)) {
-            attribues = dataTypeAttribute->second;
-            for (dataTypeAttributePropertySegment = attribues.begin(); dataTypeAttributePropertySegment != attribues.end(); dataTypeAttributePropertySegment++) {
-                foundCount = 0;
-                std::string fieldName;
-                for (dataTypeAttributeProperty = dataTypeAttributePropertySegment->begin(); dataTypeAttributeProperty != dataTypeAttributePropertySegment->end(); dataTypeAttributeProperty++) {
-                    if (xmlStrncasecmp((const xmlChar*)("TypeName"), (xmlChar*)dataTypeAttributeProperty->first.data(), (UA_UInt32)dataTypeAttributeProperty->first.length()) == 0)
-                        foundCount++;
-                    else if (xmlStrncasecmp((const xmlChar*)("Name"), (xmlChar*)dataTypeAttributeProperty->first.data(), (UA_UInt32)dataTypeAttributeProperty->first.length()) == 0) {
-                        fieldName = std::string(dataTypeAttributeProperty->second);
-                        foundCount++;
-                    }
-                    if (foundCount == 2)
-                        break;
-                }
-                if (foundCount == 2) {
-                    fieldNames->push_back(fieldName);
-                }
-            }
-        }
-    }
-}
-
-// retrieves all member names and values of a structure of a user data type
-// returns true if successfully
-UA_StatusCode getStructureValues(UA_Client* client, UA_Variant structVal, UA_DataType* userDataType, std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>* dataTypeAttributes, std::map<std::string, UA_Variant>* structureMembers) {
-    const UA_DataType* mt;
-    const UA_DataType* typelists[2] = { UA_TYPES, &userDataType[-userDataType->typeIndex] };
-    const UA_DataTypeMember* m;
-    std::map<std::string, UA_Variant>::iterator it;
-    std::vector<std::string> fieldNames;
-    std::vector<std::string> propertySet;
-    std::vector<std::string>::iterator propertySetIt;
-    UA_Boolean* variantContent = 0x0;
-    UA_BrowseResponse bResp1;
-    UA_Byte pos = 0;
-    UA_Byte resultingBits = 0;
-    UA_Byte* pValidBits = 0x0;
-    UA_Byte* pValue = 0x0;
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    UA_Variant* validBits = 0x0;
-    UA_Variant* value = 0x0;
-    uintptr_t ptrs = (uintptr_t)structVal.data;
-
-    getStructureFieldNames(userDataType, dataTypeAttributes, &fieldNames);
-    if (!UA_NodeId_equal(&structVal.type->typeId, &userDataType->typeId)) {
-        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Data types don't match");
-        return UA_STATUSCODE_BAD;
-    }
-    if (ptrs && ((UA_ExtensionObject*)ptrs)->encoding == UA_EXTENSIONOBJECT_ENCODED_BYTESTRING) {
-        if (fieldNames.size() == userDataType->membersSize) {
-            for (UA_UInt32 i = 0; i < userDataType->membersSize; ++i) {
-                m = &userDataType->members[i];
-                mt = &typelists[!m->namespaceZero][m->memberTypeIndex];
-                ptrs += m->padding;
-                if (!m->isArray) {
-                    UA_Variant varVal;
-                    UA_Variant_init(&varVal);
-                    retval = UA_Variant_setScalarCopy(&varVal, (void*)ptrs, mt);
-                    if(retval == UA_STATUSCODE_GOOD)
-                        structureMembers->insert(std::pair<std::string, UA_Variant>(std::string(fieldNames[i]), varVal));
-                    ptrs += mt->memSize;
-                }
-            }
-            if (structureMembers->size() >= 2) {
-                it = structureMembers->begin();
-                value = &it->second;
-                it++;
-                validBits = &it->second;
-                pValue = ((UA_ByteString*)value->data)->data;
-                /*printf("%-25s: ", "value");
-                binary_print(*pValue);
-                printf(" (%d)\n", *pValue);*/
-                pValidBits = ((UA_ByteString*)validBits->data)->data;
-               /* printf("%-25s: ", "valid bits");
-                binary_print(*pValidBits);
-                printf(" (%d)\n", *pValidBits);*/
-                resultingBits = *pValue & *pValidBits;
-                /*printf("%-25s: ", "result");
-                binary_print(resultingBits);
-                printf(" (%d)\n", resultingBits);*/
-                retval = browseNodeId(client, userDataType->typeId, &bResp1);
-                if (retval == UA_STATUSCODE_GOOD) {
-                    getPropertyDescription(client, &bResp1, &propertySet);
-                    structureMembers->clear();
-                    for (propertySetIt = propertySet.begin(); propertySetIt != propertySet.end(); ++propertySetIt) {
-                        //printf("%-25s: %s\n", propertySetIt->c_str(), (resultingBits & 0x01 << pos) ? "TRUE" : "FALSE");
-                        UA_Variant varVal;
-                        UA_Variant_init(&varVal);
-                        variantContent = UA_Boolean_new();
-                        *variantContent = resultingBits & 0x01 << pos++;
-                        UA_Variant_setScalar(&varVal, variantContent, &UA_TYPES[UA_TYPES_BOOLEAN]);                   
-                        structureMembers->insert(std::pair<std::string, UA_Variant>(std::string(*propertySetIt), varVal));
-                    }
-                }
-                else {
-                    printWarn("could not retrieve property descriptions", userDataType->typeId);
-                }
-            }
-        }
-    }
-    else {
-        if (fieldNames.size() == userDataType->membersSize) {
-            for (UA_UInt32 i = 0; i < userDataType->membersSize; ++i) {
-                m = &userDataType->members[i];
-                mt = &typelists[!m->namespaceZero][m->memberTypeIndex];
-                ptrs += m->padding;
-                UA_Variant varVal;
-                UA_Variant_init(&varVal);
-                UA_Variant_setScalarCopy(&varVal, (void*)ptrs, mt);
-                if (!m->isArray) {
-                    structureMembers->insert(std::pair<std::string, UA_Variant>(std::string(fieldNames[i]), varVal));
-                    ptrs += mt->memSize;
-                }
-            }
-        }
-    }
-    return retval;
-}
-
 // retrieves the data type ID of a node ID
 // returns true if successfully
 UA_StatusCode getTypeId(UA_Client* client, UA_NodeId pvId, UA_NodeId* pvTypeId) {
@@ -659,96 +309,6 @@ void getXmlDocMap(std::map<UA_UInt32, std::string>* dictionaries, std::map<UA_UI
     }
 }
 
-// retrieves user data type and user data type attributes of a node ID
-// returns UA_STATUSCODE_UNCERTAIN for an enumeration, UA_STATUSCODE_GOOD for a structure and UA_STATUSCODE_BAD if no user data type was found
-UA_StatusCode getUserDataTypeAttributes(UA_Client* client, UA_NodeId pvId, std::map<UA_UInt32, std::string>* dictionaries, UA_DataType* userDataType, std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>* dataTypeAttributes) {
-    if (!client) {
-        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "client session invalid");
-        return UA_STATUSCODE_BAD;
-    }
-    if (UA_NodeId_isNull(&pvId)) {
-        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Node ID must not be NULL");
-        return UA_STATUSCODE_BAD;
-    }
-    UA_NodeId dataTypeId;
-    UA_QualifiedName browseName;
-    UA_StatusCode retval;
-    std::map<UA_UInt32, xmlDocPtr> xmlDocMap;
-    std::map<UA_UInt32, xmlDocPtr>::iterator xmlDocNode;
-    xmlNode* attributeNode = NULL;
-    xmlDocNode = xmlDocMap.begin();
-    dataTypeAttributes->clear();
-    UA_NodeId_init(&dataTypeId);
-    UA_QualifiedName_init(&browseName);
-    retval = getTypeId(client, pvId, &dataTypeId);
-    if (retval != UA_STATUSCODE_GOOD) {
-        printWarn("failed to read value type node ID", pvId);
-        UA_QualifiedName_clear(&browseName);
-        return retval;
-    }
-    if (dataTypeId.namespaceIndex == 0) {
-        char warn[256];
-        UA_String out;
-        UA_print(&dataTypeId, &UA_TYPES[UA_TYPES_NODEID], &out);
-        sprintf(warn, "has no user data type (Node ID of data type is %.*s)", (UA_UInt16)out.length, out.data);
-        printWarn(warn, pvId);
-        UA_String_clear(&out);
-        UA_QualifiedName_clear(&browseName);
-        return UA_STATUSCODE_BAD;
-    }
-    retval = UA_Client_readBrowseNameAttribute(client, dataTypeId, &browseName);
-    if (retval != UA_STATUSCODE_GOOD || !browseName.name.length) {
-        printWarn("failed to read browse name", pvId);
-        UA_QualifiedName_clear(&browseName);
-        return retval;
-    }
-    getXmlDocMap(dictionaries, &xmlDocMap);
-    retval = UA_STATUSCODE_BAD;
-    for (xmlDocNode = xmlDocMap.begin(); xmlDocNode != xmlDocMap.end(); ++xmlDocNode) {
-        xmlNode* root_element = xmlDocGetRootElement(xmlDocNode->second);
-        if (findBrowseName(root_element, browseName.name, &attributeNode)) {
-            getAttributes(attributeNode, UA_NodeId_hash(&dataTypeId), dataTypeAttributes);
-            retval = UA_STATUSCODE_GOOD;
-            break;
-        }
-    }
-    UA_NodeId_copy(&dataTypeId, &userDataType->typeId);
-#ifdef UA_ENABLE_TYPEDESCRIPTION
-        userDataType->typeName = (char*)malloc((browseName.name.length + 1) * sizeof(char));
-        if (userDataType->typeName) {
-            strncpy((char*)userDataType->typeName, (char*)browseName.name.data, browseName.name.length);
-            ((char*)userDataType->typeName)[browseName.name.length] = 0x0;
-        }
-#endif   
-    if (isEnum(dataTypeId, dataTypeAttributes)) {
-        retval = UA_STATUSCODE_UNCERTAIN;
-    } else if (!getUserDataType(client, pvId, dataTypeAttributes, userDataType)) {
-        retval = UA_STATUSCODE_BAD;
-    }
-    UA_NodeId_clear(&dataTypeId);
-    UA_QualifiedName_clear(&browseName);
-    return retval;
-}
-
-// checks whether the data type is an enumeration
-UA_Boolean isEnum(UA_NodeId dataTypeId, std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>* dataTypeAttributes) {
-    std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>::iterator dataTypeAttribute;
-    std::vector<std::map<std::string, std::string>>::iterator dataTypeAttributePropertySegment;
-    std::map<std::string, std::string>::iterator dataTypeAttributeProperty;
-    dataTypeAttribute = dataTypeAttributes->find(UA_NodeId_hash(&dataTypeId));
-    if (dataTypeAttribute == dataTypeAttributes->end())
-        return UA_FALSE;
-    dataTypeAttributePropertySegment = dataTypeAttribute->second.begin();
-    if (dataTypeAttributePropertySegment == dataTypeAttribute->second.end())
-        return UA_FALSE;
-    dataTypeAttributeProperty = dataTypeAttributePropertySegment->find(EXO_DATATYPE_NS0ID);
-    if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end())
-        return UA_FALSE;
-    if (std::stoul(dataTypeAttributeProperty->second) == UA_NS0ID_ENUMDEFINITION)
-        return UA_TRUE;
-    return UA_FALSE;
-}
-
 // checks whether the xml node is a leaf (child)
 UA_Boolean isLeaf(xmlNode* node) {
     if (!node)
@@ -759,34 +319,6 @@ UA_Boolean isLeaf(xmlNode* node) {
         child = child->next;
     }
     return UA_TRUE;
-}
-
-// prints all user data attributes of given user data type
-void printUserDataTypeAttributes(std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>* dataTypeAttributes, UA_DataType* dataType) {
-    if (UA_NodeId_equal(&dataType->typeId, &UA_NODEID_NULL))
-        return;
-    std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>::iterator dataTypeAttribute;
-    std::vector<std::map<std::string, std::string>>::iterator dataTypeAttributePropertySegment;
-    std::map<std::string, std::string>::iterator dataTypeAttributeProperty;
-    dataTypeAttribute = dataTypeAttributes->find(UA_NodeId_hash(&dataType->typeId));
-    if (dataTypeAttribute != dataTypeAttributes->end()) {
-        dataTypeAttributePropertySegment = (dataTypeAttribute->second).begin();
-        if (dataTypeAttributePropertySegment != (dataTypeAttribute->second).end()) {
-            dataTypeAttributeProperty = dataTypeAttributePropertySegment->find(EXO_DATANAME);
-            if (dataTypeAttributeProperty != dataTypeAttributePropertySegment->end()) {
-                UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s", dataTypeAttributeProperty->second.c_str());
-                for (dataTypeAttributePropertySegment = dataTypeAttribute->second.begin(); dataTypeAttributePropertySegment != dataTypeAttribute->second.end(); ++dataTypeAttributePropertySegment) {
-                    for (dataTypeAttributeProperty = dataTypeAttributePropertySegment->begin(); dataTypeAttributeProperty != dataTypeAttributePropertySegment->end(); ++dataTypeAttributeProperty) {
-                        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "   %s = %s", dataTypeAttributeProperty->first.c_str(), dataTypeAttributeProperty->second.c_str());
-                    }
-                    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "------------------------------------------------------");
-                }
-            }
-        }
-    }
-    else {
-        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "DataType not found");
-    }
 }
 
 // shortcut for warning message; the node ID is printed before the message
@@ -884,11 +416,10 @@ static UA_StatusCode printByteString(UA_PrintContext* ctx, const UA_ByteString* 
 }
 
 // prints variant data type ENUM to UA_String
-static UA_StatusCode UA_printEnum(const void* pData, UA_DataType* userDataType, std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>* dataTypeAttributes, UA_String* output) {
-    std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>::iterator dataTypeAttribute;
+static UA_StatusCode UA_printEnum(const void* pData, UA_DataType* userDataType, UA_String* output) {
+    UA_UInt32 typeIdHash = UA_NodeId_hash(&userDataType->typeId);
+    std::map<UA_UInt32, type_properties_t>::iterator typeProperty = getTypeProperty(typeIdHash);
     std::vector<std::map<std::string, std::string>>::iterator dataTypeAttributePropertySegment;
-    std::map<std::string, std::string>::iterator dataTypeAttributeProperty;
-    std::map<std::string, std::string>::iterator dataTypeAttributeProperty2;
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
     UA_PrintContext ctx = UA_PrintContext();
     ctx.depth = 0;
@@ -902,7 +433,7 @@ static UA_StatusCode UA_printEnum(const void* pData, UA_DataType* userDataType, 
     ctx.depth++;
 
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addName(&ctx, "DataType");
+    retval |= UA_PrintContext_addName(&ctx, EXO_DATATYPE);
 #ifdef UA_ENABLE_TYPEDESCRIPTION
     retval |= UA_PrintContext_addString(&ctx, p->type->typeName);
 #endif
@@ -914,67 +445,20 @@ static UA_StatusCode UA_printEnum(const void* pData, UA_DataType* userDataType, 
         retval |= UA_PrintContext_addString(&ctx, "{");
         ctx.depth++;
         value = *((UA_UInt32*)p->data);
-        dataTypeAttribute = dataTypeAttributes->find(UA_NodeId_hash(&userDataType->typeId));
-        if (dataTypeAttribute == dataTypeAttributes->end())
+        dataTypeAttributePropertySegment = typeProperty->second.dataTypeAttributes.begin();
+        if (dataTypeAttributePropertySegment == typeProperty->second.dataTypeAttributes.end())
             return UA_STATUSCODE_BAD;
-        dataTypeAttributePropertySegment = dataTypeAttribute->second.begin();
-        if (dataTypeAttributePropertySegment == dataTypeAttribute->second.end())
-            return UA_STATUSCODE_BAD;
-        dataTypeAttributeProperty = dataTypeAttributePropertySegment->find(EXO_DATATYPE_NS0ID);
-        if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end())
-            return UA_STATUSCODE_BAD;
-
-        if (std::stoul(dataTypeAttributeProperty->second) == UA_NS0ID_ENUMDEFINITION) {
-            for (; dataTypeAttributePropertySegment != dataTypeAttribute->second.end(); dataTypeAttributePropertySegment++) {
-                for (dataTypeAttributeProperty = dataTypeAttributePropertySegment->begin(); dataTypeAttributeProperty != dataTypeAttributePropertySegment->end(); dataTypeAttributeProperty++) {
-                    UA_Boolean isValidNumber = UA_TRUE;
-                    for (UA_UInt32 i = 0; i < dataTypeAttributeProperty->second.length(); i++) {
-                        if (dataTypeAttributeProperty->second.at(i) < 48 || dataTypeAttributeProperty->second.at(i) > 57) {
-                            isValidNumber = UA_FALSE;
-                            break;
-                        }
-                    }
-                    if (isValidNumber && std::stoi(dataTypeAttributeProperty->second) == value) {
-                        if((dataTypeAttributeProperty2 = dataTypeAttributePropertySegment->find(EXO_DATANAME)) == dataTypeAttributePropertySegment->end())
-                            continue;
-                        retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-                        UA_PrintOutput* out = UA_PrintContext_addOutput(&ctx, dataTypeAttributeProperty->second.length());
-                        if (!out)
-                            retval |= UA_STATUSCODE_BADOUTOFMEMORY;
-                        else
-                            memcpy(&out->data, dataTypeAttributeProperty->second.c_str(), dataTypeAttributeProperty->second.length());
-                        retval |= UA_PrintContext_addString(&ctx, " (");
-                        out = UA_PrintContext_addOutput(&ctx, dataTypeAttributeProperty2->second.length());
-                        if (!out)
-                            retval |= UA_STATUSCODE_BADOUTOFMEMORY;
-                        else
-                            memcpy(&out->data, dataTypeAttributeProperty2->second.c_str(), dataTypeAttributeProperty2->second.length());
-                        retval |= UA_PrintContext_addString(&ctx, ")");
-                    }
-                }
-            }
-        }
-        
-
-        /*for (const std::pair<std::string, UA_Variant>& valSet : *structureMembers) {
+        if (value < typeProperty->second.propertyMap.size()) {
             retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-            const UA_DataType* type = &UA_TYPES[valSet.second.type->typeIndex];
-            size_t len = valSet.first.length();
-            UA_PrintOutput* out = UA_PrintContext_addOutput(&ctx, len);
+            UA_PrintOutput* out = UA_PrintContext_addOutput(&ctx, typeProperty->second.propertyMap[value].length());
             if (!out)
                 retval |= UA_STATUSCODE_BADOUTOFMEMORY;
             else
-                memcpy(&out->data, valSet.first.c_str(), len);
-            retval |= UA_PrintContext_addString(&ctx, ": ");
-            UA_print(valSet.second.data, type, &outString);
-            len = outString.length;
-            out = UA_PrintContext_addOutput(&ctx, len);
-            if (!out)
-                retval |= UA_STATUSCODE_BADOUTOFMEMORY;
-            else
-                memcpy(&out->data, outString.data, outString.length);
-            UA_String_clear(&outString);
-        }*/
+                memcpy(&out->data, typeProperty->second.propertyMap[value].c_str(), typeProperty->second.propertyMap[value].length());
+        }
+        else {
+            retval |= UA_PrintContext_addString(&ctx, " (is not a number)");
+        }
     }
     ctx.depth--;
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
@@ -1011,12 +495,69 @@ static UA_StatusCode UA_printEnum(const void* pData, UA_DataType* userDataType, 
 }
 
 // prints variant data type STRUCTURE to UA_String
-static UA_StatusCode UA_printStructure(const void* pData, std::map<std::string, UA_Variant>* structureMembers, UA_String* output) {
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
+static UA_StatusCode UA_printStructure(const void* pData, UA_DataType* userDataType, UA_String* output) {
+    const UA_DataType* dataType;
+    std::vector<UA_Variant> values;
+    UA_Boolean* variantContent = 0x0;
+    UA_Byte pos = 0;
+    UA_Byte resultingBits = 0;
+    UA_Byte* pValidBits = 0x0;
+    UA_Byte* pValue = 0x0;
+    UA_DataTypeMember* typeMember;
     UA_PrintContext ctx = UA_PrintContext();
+    UA_StatusCode retval = UA_STATUSCODE_GOOD;
+    UA_UInt32 nodeIdHash = UA_NodeId_hash(&userDataType->typeId);
+    UA_Variant* p = (UA_Variant*)pData;
+    UA_Variant* validBits = 0x0;
+    UA_Variant* value = 0x0;
+    uintptr_t ptrs = (uintptr_t)p->data;
+    typeProperty = typePropertiesMap.find(nodeIdHash);
+    if (typeProperty == typePropertiesMap.end()) {
+        UA_print(pData, &UA_TYPES[userDataType->typeIndex], output);
+        return UA_STATUSCODE_BAD;
+    }
+    if (ptrs && ((UA_ExtensionObject*)ptrs)->encoding == UA_EXTENSIONOBJECT_ENCODED_BYTESTRING) {
+        for (UA_UInt16 i = 0; i < typeProperty->second.dataType.membersSize; i++) {
+            typeMember = &typeProperty->second.dataType.members[i];
+            dataType = &UA_TYPES[typeMember->memberTypeIndex];
+            ptrs += typeMember->padding;
+            if (!typeMember->isArray) {
+                UA_Variant varVal;
+                UA_Variant_init(&varVal);
+                retval = UA_Variant_setScalarCopy(&varVal, (void*)ptrs, dataType);
+                if (retval == UA_STATUSCODE_GOOD)
+                    values.push_back(varVal);
+                ptrs += dataType->memSize;
+            }
+        }
+        if (values.size() == 2) {
+            value = &values.at(0);
+            validBits = &values.at(1);
+            pValue = ((UA_ByteString*)value->data)->data;
+            /*printf("\n%-25s: ", "value");
+            binary_print(*pValue);
+            printf(" (%d)\n", *pValue);*/
+            pValidBits = ((UA_ByteString*)validBits->data)->data;
+            /*printf("%-25s: ", "valid bits");
+            binary_print(*pValidBits);
+            printf(" (%d)\n", *pValidBits);*/
+            resultingBits = *pValue & *pValidBits;
+            /*printf("%-25s: ", "result");
+            binary_print(resultingBits);
+            printf(" (%d)\n", resultingBits);*/
+            values.clear();
+            for (std::string property : typeProperty->second.propertyMap) {
+                UA_Variant varVal;
+                UA_Variant_init(&varVal);
+                variantContent = UA_Boolean_new();
+                *variantContent = resultingBits & 0x01 << pos++;
+                UA_Variant_setScalar(&varVal, variantContent, &UA_TYPES[UA_TYPES_BOOLEAN]);
+                values.push_back(varVal);
+            }
+        }
+    }
     ctx.depth = 0;
     TAILQ_INIT(&ctx.outputs);
-    UA_Variant* p = (UA_Variant*)pData;
     UA_String_init(output);
     if (!p->type)
         return UA_PrintContext_addString(&ctx, "NullVariant");
@@ -1024,7 +565,7 @@ static UA_StatusCode UA_printStructure(const void* pData, std::map<std::string, 
     ctx.depth++;
 
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addName(&ctx, "DataType");
+    retval |= UA_PrintContext_addName(&ctx, EXO_DATATYPE);
 #ifdef UA_ENABLE_TYPEDESCRIPTION
     retval |= UA_PrintContext_addString(&ctx, p->type->typeName);
 #endif
@@ -1036,17 +577,17 @@ static UA_StatusCode UA_printStructure(const void* pData, std::map<std::string, 
         retval |= UA_PrintContext_addString(&ctx, "{");
         ctx.depth++;
         UA_String outString;
-        for (const std::pair<std::string, UA_Variant>& valSet : *structureMembers) {
+        for (UA_UInt16 i = 0; i < typeProperty->second.propertyMap.size(); i++) {
             retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-            const UA_DataType* type = &UA_TYPES[valSet.second.type->typeIndex];
-            size_t len =valSet.first.length();
+            const UA_DataType* type = &UA_TYPES[values.at(i).type->typeIndex];
+            size_t len = typeProperty->second.propertyMap.at(i).length();
             UA_PrintOutput* out = UA_PrintContext_addOutput(&ctx, len);
             if (!out)
                 retval |= UA_STATUSCODE_BADOUTOFMEMORY;
             else
-                memcpy(&out->data, valSet.first.c_str(), len);
+                memcpy(&out->data, typeProperty->second.propertyMap.at(i).c_str(), len);
             retval |= UA_PrintContext_addString(&ctx, ": ");
-            UA_print(valSet.second.data, type, &outString);
+            UA_print(values.at(i).data, type, &outString);
             len = outString.length;
             out = UA_PrintContext_addOutput(&ctx, len);
             if (!out)
@@ -1054,7 +595,7 @@ static UA_StatusCode UA_printStructure(const void* pData, std::map<std::string, 
             else
                 memcpy(&out->data, outString.data, outString.length);
             UA_String_clear(&outString);
-        }        
+        }
     }
     ctx.depth--;
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
@@ -1091,12 +632,14 @@ static UA_StatusCode UA_printStructure(const void* pData, std::map<std::string, 
 }
 
 // prints variant data type UNION to UA_String
-static UA_StatusCode UA_printUnion(const void* pData, std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>* dataTypeAttributes, UA_String* output) {
+static UA_StatusCode UA_printUnion(const void* pData, UA_DataType* userDataType, UA_String* output) {
+    UA_UInt32 typeIdHash = UA_NodeId_hash(&userDataType->typeId);
+    std::map<UA_UInt32, type_properties_t>::iterator typeProperty = getTypeProperty(typeIdHash);
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
     UA_PrintContext ctx = UA_PrintContext();
     ctx.depth = 0;
     TAILQ_INIT(&ctx.outputs);
-    UA_Variant* p =(UA_Variant*)pData;
+    UA_Variant* p = (UA_Variant*)pData;
     UA_String_init(output);
     if (!p->type)
         return UA_PrintContext_addString(&ctx, "NullVariant");
@@ -1104,7 +647,7 @@ static UA_StatusCode UA_printUnion(const void* pData, std::map<UA_UInt32, std::v
     ctx.depth++;
 
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addName(&ctx, "DataType");
+    retval |= UA_PrintContext_addName(&ctx, EXO_DATATYPE);
 #ifdef UA_ENABLE_TYPEDESCRIPTION
     retval |= UA_PrintContext_addString(&ctx, p->type->typeName);
 #endif
@@ -1122,48 +665,44 @@ static UA_StatusCode UA_printUnion(const void* pData, std::map<UA_UInt32, std::v
         retval |= UA_PrintContext_addString(&ctx, out);
         retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
         if (switchIndex <= p->type->membersSize) {
-            std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>>::iterator dataTypeAttribute;
             std::vector<std::map<std::string, std::string>>::iterator dataTypeAttributePropertySegment;
             std::map<std::string, std::string>::iterator dataTypeAttributeProperty;
-            dataTypeAttribute = dataTypeAttributes->find(UA_NodeId_hash(&p->type->typeId));
-            if (dataTypeAttribute != dataTypeAttributes->end()) {
-                for(dataTypeAttributePropertySegment = dataTypeAttribute->second.begin(); dataTypeAttributePropertySegment != dataTypeAttribute->second.end(); dataTypeAttributePropertySegment++) {
-                    dataTypeAttributeProperty = dataTypeAttributePropertySegment->find("SwitchValue");
-                    if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end())
-                        continue;
-                    UA_UInt32 index = std::stoi(dataTypeAttributeProperty->second);
-                    if (switchIndex != index)
-                        continue;
-                    dataTypeAttributeProperty = dataTypeAttributePropertySegment->find(EXO_DATANAME);
-                    if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end())
-                        continue;
-                    size_t len = dataTypeAttributeProperty->second.length();
-                    UA_PrintOutput* out = UA_PrintContext_addOutput(&ctx, len);
-                    if (!out)
-                        retval |= UA_STATUSCODE_BADOUTOFMEMORY;
-                    else
-                        memcpy(&out->data, dataTypeAttributeProperty->second.c_str(), dataTypeAttributeProperty->second.length());
-                    retval |= UA_PrintContext_addString(&ctx, ": ");
-                    dataTypeAttributeProperty = dataTypeAttributePropertySegment->find("TypeName");
-                    if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end())
-                        continue;
-                    const UA_DataType* dataType = parseDataType(dataTypeAttributeProperty->second);
-                    UA_String outString;
-                    UA_print((UA_Byte*)p->data + sizeof(UA_UInt32) + p->type->members[switchIndex - 1].padding, dataType/*&UA_TYPES[p->type->members[switchIndex - 1].memberTypeIndex]*/, &outString);
-                    len = outString.length;
-                    out = UA_PrintContext_addOutput(&ctx, len);
-                    if (!out)
-                        retval |= UA_STATUSCODE_BADOUTOFMEMORY;
-                    else
-                        memcpy(&out->data, outString.data, outString.length);
-                    UA_String_clear(&outString);
-                }
+            for (dataTypeAttributePropertySegment = typeProperty->second.dataTypeAttributes.begin(); dataTypeAttributePropertySegment != typeProperty->second.dataTypeAttributes.end(); dataTypeAttributePropertySegment++) {
+                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find("SwitchValue");
+                if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end())
+                    continue;
+                UA_UInt32 index = std::stoi(dataTypeAttributeProperty->second);
+                if (switchIndex != index)
+                    continue;
+                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find(EXO_DATANAME);
+                if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end())
+                    continue;
+                size_t len = dataTypeAttributeProperty->second.length();
+                UA_PrintOutput* out = UA_PrintContext_addOutput(&ctx, len);
+                if (!out)
+                    retval |= UA_STATUSCODE_BADOUTOFMEMORY;
+                else
+                    memcpy(&out->data, dataTypeAttributeProperty->second.c_str(), dataTypeAttributeProperty->second.length());
+                retval |= UA_PrintContext_addString(&ctx, ": ");
+                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find("TypeName");
+                if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end())
+                    continue;
+                const UA_DataType* dataType = parseDataType(dataTypeAttributeProperty->second);
+                UA_String outString;
+                UA_print((UA_Byte*)p->data + sizeof(UA_UInt32) + p->type->members[switchIndex - 1].padding, dataType, &outString);
+                len = outString.length;
+                out = UA_PrintContext_addOutput(&ctx, len);
+                if (!out)
+                    retval |= UA_STATUSCODE_BADOUTOFMEMORY;
+                else
+                    memcpy(&out->data, outString.data, outString.length);
+                UA_String_clear(&outString);
             }
         }
         else {
             retval |= UA_PrintContext_addString(&ctx, "Union switch index is invalid");
         }
-    ctx.depth--;
+        ctx.depth--;
         retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
     }
     retval |= UA_PrintContext_addString(&ctx, "}");
@@ -1198,6 +737,37 @@ static UA_StatusCode UA_printUnion(const void* pData, std::map<UA_UInt32, std::v
     return retval;
 }
 
+// debug-print of data type property structure
+void printTypeProperty(std::map<UA_UInt32, type_properties_t>::iterator typeProperty) {
+    UA_String out;
+
+    printf("%40.*s: ", (UA_UInt16)typeProperty->second.browseName.name.length, typeProperty->second.browseName.name.data);
+    UA_print(&typeProperty->second.dataType.typeId, &UA_TYPES[UA_TYPES_NODEID], &out);
+    printf("Node ID: %.*s (%u); ", (UA_UInt16)out.length, out.data, typeProperty->first);
+    UA_String_clear(&out);
+    UA_printNodeClass(typeProperty->second.nodeClass, &out);
+    printf("Node Class: %.*s (%d); ", (UA_UInt16)out.length, out.data, (UA_UInt16)typeProperty->second.nodeClass);
+    UA_String_clear(&out);
+    UA_print(&typeProperty->second.dataType.binaryEncodingId, &UA_TYPES[UA_TYPES_NODEID], &out);
+    printf("Binary Encoding ID: %.*s; ", (UA_UInt16)out.length, out.data);
+    UA_String_clear(&out);
+    UA_print(&typeProperty->second.dataTypeId, &UA_TYPES[UA_TYPES_NODEID], &out);
+    printf("Type ID: %.*s; ", (UA_UInt16)out.length, out.data);
+    UA_String_clear(&out);
+    UA_print(&typeProperty->second.typeDefId, &UA_TYPES[UA_TYPES_NODEID], &out);
+    printf("Type Definition ID: %.*s; ", (UA_UInt16)out.length, out.data);
+    UA_String_clear(&out);
+    UA_print(&typeProperty->second.propertyId, &UA_TYPES[UA_TYPES_NODEID], &out);
+    printf("Property Node ID: %.*s; ", (UA_UInt16)out.length, out.data);
+    UA_String_clear(&out);
+    UA_print(&typeProperty->second.subTypeId, &UA_TYPES[UA_TYPES_NODEID], &out);
+    printf("Subtype ID: %.*s; ", (UA_UInt16)out.length, out.data);
+    UA_String_clear(&out);
+    UA_print(&typeProperty->second.descriptionId, &UA_TYPES[UA_TYPES_NODEID], &out);
+    printf("Description ID: %.*s\n", (UA_UInt16)out.length, out.data);
+    UA_String_clear(&out);
+}
+
 // calculates the additional memory consumption (padding) of structure elements in the RAM
 // returns resulting RAM size of whole structure
 // this is a sub function of buildUserDataType
@@ -1207,7 +777,9 @@ UA_Byte calc_struct_padding(std::vector<const UA_DataType*>* structMemberTypes, 
     UA_Byte bytes = 0;
     UA_Byte padding = 0;
     UA_Byte currentMemoryBank = 0;
-    for(const UA_DataType* dataType : *structMemberTypes) {
+    for (const UA_DataType* dataType : *structMemberTypes) {
+        if (!dataType)
+            continue;
         padding = 0;
         bytes = (UA_Byte)dataType->memSize;
         if (bytes > maxVal)
@@ -1243,25 +815,305 @@ UA_Byte calc_struct_padding(std::vector<const UA_DataType*>* structMemberTypes, 
     return size;
 }
 
-int main(int argc, char* argv[]) {   
+// find the right data type property structure
+std::map<UA_UInt32, type_properties_t>::iterator getTypeProperty(UA_UInt32 nodeIdHash) {
+    std::map<UA_UInt32, type_properties_t>::iterator type_property;
+    type_property = typePropertiesMap.find(nodeIdHash);
+    if (type_property == typePropertiesMap.end()) {
+        type_properties_t properties;
+        memset(&properties, 0x0, sizeof(type_properties_t));
+        UA_QualifiedName_init(&properties.browseName);
+        typePropertiesMap.insert(std::pair<UA_UInt32, type_properties_t>(nodeIdHash, properties));
+        type_property = typePropertiesMap.find(nodeIdHash);
+    }
+    return type_property;
+}
+
+// search data type tree recursively and collect node ids
+void scanForTypeIds(UA_BrowseResponse* bResp, std::map<UA_UInt32, UA_NodeId>* ids) {
+    UA_BrowseResult bRes;
+    UA_ReferenceDescription rDesc;
+    for (size_t i = 0; i < bResp->resultsSize; ++i) {
+        bRes = bResp->results[i];
+        for (size_t j = 0; j < bRes.referencesSize; ++j) {
+            rDesc = bRes.references[j];
+            ids->insert(std::pair<UA_UInt32, UA_NodeId>(UA_NodeId_hash(&rDesc.nodeId.nodeId), rDesc.nodeId.nodeId));
+        }
+    }
+}
+
+// translate node class to string
+void UA_printNodeClass(UA_NodeClass nodeClass, UA_String* out) {
+    switch (nodeClass) {
+    case UA_NODECLASS_UNSPECIFIED: *out = UA_STRING_ALLOC("UNSPECIFIED"); break;
+    case  UA_NODECLASS_OBJECT: *out = UA_STRING_ALLOC("OBJECT"); break;
+    case UA_NODECLASS_VARIABLE: *out = UA_STRING_ALLOC("VARIABLE"); break;
+    case UA_NODECLASS_METHOD: *out = UA_STRING_ALLOC("METHOD"); break;
+    case UA_NODECLASS_OBJECTTYPE: *out = UA_STRING_ALLOC("OBJECTTYPE"); break;
+    case UA_NODECLASS_VARIABLETYPE: *out = UA_STRING_ALLOC("VARIABLETYPE"); break;
+    case UA_NODECLASS_REFERENCETYPE: *out = UA_STRING_ALLOC("REFERENCETYPE"); break;
+    case  UA_NODECLASS_DATATYPE: *out = UA_STRING_ALLOC("DATATYPE"); break;
+    case UA_NODECLASS_VIEW: *out = UA_STRING_ALLOC("VIEW"); break;
+    case __UA_NODECLASS_FORCE32BIT: *out = UA_STRING_ALLOC("FORCE32BIT"); break;
+    default: *out = UA_STRING_ALLOC("UNKNOWN"); break;
+    }
+}
+
+void initializeUserDataTypeIds(UA_Client* client) {
+    std::map<std::string, std::string>::iterator dataTypeAttributeProperty;
+    std::map<UA_UInt32, std::string> dictionaries;
+    std::map<UA_UInt32, type_properties_t>::iterator typeProperty;
+    std::map<UA_UInt32, UA_NodeId> ids;
+    std::map<UA_UInt32, xmlDocPtr> xmlDocMap;
+    std::map<UA_UInt32, xmlDocPtr>::iterator xmlDocNode;
+    std::vector<const UA_DataType*> dataTypeList;
+    std::vector<std::map<std::string, std::string>>::iterator dataTypeAttributePropertySegment;
+    std::vector<UA_Byte> paddings;
+    std::vector<UA_Byte>::iterator padding;
+    std::vector<UA_UInt32> knownIds;
+    std::vector<UA_UInt32>::iterator knownId;
+    UA_BrowseResponse bResp;
+    UA_StatusCode retval = UA_STATUSCODE_BAD;
+    UA_String out;
+    UA_DataType* dataType = 0x0;
+    const UA_DataType* currentType = 0x0;
+    UA_UInt32 typeIdHash = 0;
+    type_properties_t* typeProperties;
+    xmlChar* parentName = NULL;
+    xmlNode* attributeNode = NULL;
+    numberOfUserDataTypes = 0;
+
+    // retrieve all dictionaries of OPC UA server 
+    if (getDictionaries(client, &dictionaries)) {
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "retrieve dictionaries was successful");
+    }
+    else {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "retrieve dictionaries failed");
+        return;
+    }
+    // build a document map of dictionary entries
+    getXmlDocMap(&dictionaries, &xmlDocMap);
+    // collect known basic data types
+    ids.insert(std::pair<UA_UInt32, UA_NodeId>(UA_NodeId_hash(&NS0ID_BASEDATATYPE), NS0ID_BASEDATATYPE));
+    while (knownIds.size() != ids.size()) {
+        for (const std::pair<UA_UInt32, UA_NodeId>& id : ids) {
+            if ((knownId = std::find(knownIds.begin(), knownIds.end(), id.first)) != knownIds.end())
+                continue;
+            typeIdHash = UA_NodeId_hash(&id.second);
+            knownIds.push_back(typeIdHash);
+            retval = browseNodeId(client, id.second, &bResp);
+            if (retval != UA_STATUSCODE_GOOD)
+                continue;
+            if (id.second.namespaceIndex > 0 || id.second.identifier.numeric >= UA_TYPES_COUNT) {
+                typeProperty = getTypeProperty(typeIdHash);
+                typeProperties = &typeProperty->second;
+                typeProperties->dataType.typeId = id.second;
+                for (UA_UInt32 i = 0; i < bResp.results[0].referencesSize; i++)
+                    typeProperties->descriptionList.push_back(bResp.results[0].references[i]);
+            }
+            scanForTypeIds(&bResp, &ids);
+        }
+    }
+    // collect properties of data types
+    for (typeProperty = typePropertiesMap.begin(); typeProperty != typePropertiesMap.end();) {
+        typeProperties = &typeProperty->second;
+        dataType = &typeProperties->dataType;
+        retval = UA_Client_readNodeClassAttribute(client, dataType->typeId, &typeProperties->nodeClass);
+        if (typeProperties->nodeClass != UA_NODECLASS_DATATYPE) {
+            typeProperty++;
+            continue;
+        }
+        UA_NodeId_copy(&dataType->typeId, &typeProperties->dataTypeId);
+        retval = UA_Client_readBrowseNameAttribute(client, dataType->typeId, &typeProperties->browseName);
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+        dataType->typeName = (char*)malloc((typeProperties->browseName.name.length + 1) * sizeof(char));
+        if (dataType->typeName) {
+            strncpy((char*)dataType->typeName, (char*)typeProperties->browseName.name.data, typeProperties->browseName.name.length);
+            ((char*)dataType->typeName)[typeProperties->browseName.name.length] = 0x0;
+        }
+#endif 
+        for (auto& description : typeProperties->descriptionList) {
+            if (UA_NodeId_equal(&description.referenceTypeId, &NS0ID_HASTYPEDEFINITION)) {
+                typeProperties->typeDefId = description.nodeId.nodeId;
+            }
+            else if (UA_NodeId_equal(&description.referenceTypeId, &NS0ID_HASSUBTYPE)) {
+                typeProperty->second.subTypeId = description.nodeId.nodeId;
+            }
+            else if (UA_NodeId_equal(&description.referenceTypeId, &NS0ID_HASPROPERTY)) {
+                typeProperties->propertyId = description.nodeId.nodeId;
+                UA_Variant outValue;
+                if (UA_Client_readValueAttribute(client, typeProperties->propertyId, &outValue) == UA_STATUSCODE_GOOD && !UA_Variant_isScalar(&outValue)) {
+                    if (outValue.type->typeId.namespaceIndex == 0 && outValue.type->typeId.identifierType == UA_NODEIDTYPE_NUMERIC && outValue.type->typeId.identifier.numeric == UA_NS0ID_LOCALIZEDTEXT) {
+                        UA_LocalizedText* data = (UA_LocalizedText*)outValue.data;
+                        uintptr_t target = (uintptr_t)outValue.arrayDimensions;
+                        for (UA_UInt32 i = 0; i < (UA_UInt32)outValue.arrayLength; i++) {
+                            typeProperties->propertyMap.push_back(std::string((char*)data[i].text.data, data[i].text.length));
+                        }
+                    }
+                }
+            }
+            else if (UA_NodeId_equal(&description.referenceTypeId, &NS0ID_HASENCODING)) {
+                typeProperties->dataType.binaryEncodingId = description.nodeId.nodeId;
+            }
+            else if (UA_NodeId_equal(&description.referenceTypeId, &NS0ID_HASDESCRIPTION)) {
+                typeProperties->descriptionId = description.nodeId.nodeId;
+            }
+            else {
+                UA_print(&description.referenceTypeId, &UA_TYPES[UA_TYPES_NODEID], &out);
+                printf("Node ID: %.*s (%u)\t", (UA_UInt16)out.length, out.data, typeProperty->first);
+                UA_String_clear(&out);
+            }
+        }
+        // add data type properties from dictionary
+        for (xmlDocNode = xmlDocMap.begin(); xmlDocNode != xmlDocMap.end(); ++xmlDocNode) {
+            xmlNode* root_element = xmlDocGetRootElement(xmlDocNode->second);
+            if (findBrowseName(root_element, typeProperties->browseName.name, &attributeNode)) {
+                std::map<std::string, std::string> map;
+                xmlChar* parentName = xmlGetProp(attributeNode, (const xmlChar*)("Name"));
+                if (parentName) {
+                    map.insert(std::pair<std::string, std::string>(std::string(EXO_DATANAME), std::string((char*)parentName)));
+                    typeProperties->dataTypeAttributes.push_back(map);
+                    collectProperties(attributeNode, &typeProperties->dataTypeAttributes, UA_TRUE);
+                    collectProperties(attributeNode->children, &typeProperties->dataTypeAttributes, UA_FALSE);
+                }
+                retval = UA_STATUSCODE_GOOD;
+                break;
+            }
+        }
+        if (typeProperties->dataTypeAttributes.empty()) {
+            typeProperty++;
+            continue;
+        }
+        dataTypeAttributePropertySegment = typeProperties->dataTypeAttributes.begin();
+        dataTypeAttributeProperty = dataTypeAttributePropertySegment->find(EXO_DATATYPE_NS0ID);
+        if (dataTypeAttributeProperty != dataTypeAttributePropertySegment->end()) {
+            if (std::stoul(dataTypeAttributeProperty->second) == UA_NS0ID_ENUMDEFINITION) {
+                typeProperties->dataType.typeKind = UA_DATATYPEKIND_ENUM;
+                typeProperties->dataType.typeIndex = UA_TYPES_EXTENSIONOBJECT;
+            }
+            else if (std::stoul(dataTypeAttributeProperty->second) == UA_NS0ID_STRUCTUREDEFINITION) {
+                typeProperties->dataType.typeKind = UA_DATATYPEKIND_STRUCTURE;
+                typeProperties->dataType.typeIndex = UA_TYPES_EXTENSIONOBJECT;
+            }
+            else {
+                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "unknown data type kind %s", dataTypeAttributeProperty->second.c_str());
+            }
+        }
+        for (auto& dataTypeAttribute : typeProperties->dataTypeAttributes) {
+            dataTypeAttributeProperty = dataTypeAttribute.find("SwitchField");
+            if (dataTypeAttributeProperty != dataTypeAttribute.end())
+                typeProperties->dataType.typeKind = UA_DATATYPEKIND_UNION;
+            dataTypeAttributeProperty = dataTypeAttribute.find("TypeName");
+            if (dataTypeAttributeProperty != dataTypeAttribute.end()) {
+                currentType = parseDataType(dataTypeAttributeProperty->second);
+                if (currentType)
+                    dataTypeList.push_back(currentType);
+                else {
+                    UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "unknown data type %s", dataTypeAttributeProperty->second.c_str());
+                    dataTypeList.clear();
+                    break;
+                }
+            }
+        }
+        if (dataTypeList.size()) {
+            if (typeProperties->dataType.typeKind == UA_DATATYPEKIND_UNION) {
+                const UA_DataType* switchFieldType = 0x0;
+                const UA_DataType* fieldType = 0x0;
+                switchFieldType = dataTypeList.at(0);
+                for (UA_UInt32 i = 1; i < dataTypeList.size(); i++) {
+                    if (!fieldType || fieldType->memSize < dataTypeList[i]->memSize)
+                        fieldType = dataTypeList[i];
+                }
+                dataTypeList.clear();
+                dataTypeList.push_back(switchFieldType);
+                dataTypeList.push_back(fieldType);
+            }
+            typeProperties->dataType.membersSize = dataTypeList.size();
+            paddings.clear();
+            typeProperties->dataType.memSize = calc_struct_padding(&dataTypeList, &paddings);
+            typeProperties->dataType.members = (UA_DataTypeMember*)UA_malloc(typeProperties->dataType.membersSize * sizeof(UA_DataTypeMember));
+            if (typeProperties->dataType.members) {
+                memset(typeProperties->dataType.members, 0x0, typeProperties->dataType.membersSize * sizeof(UA_DataTypeMember));
+                typeProperties->dataType.pointerFree = UA_TRUE;
+                padding = paddings.begin();
+                for (UA_UInt32 i = 0; i < typeProperties->dataType.membersSize && i < dataTypeList.size() && padding != paddings.end(); i++) {
+                    if (!dataTypeList[i]) {
+                        padding++;
+                        continue;
+                    }
+                    typeProperties->dataType.members[i].memberTypeIndex = dataTypeList[i]->typeIndex;
+                    typeProperties->dataType.members[i].isArray = UA_FALSE;
+                    typeProperties->dataType.members[i].isOptional = UA_FALSE;
+                    if (dataTypeList[i]->typeIndex > UA_TYPES_DOUBLE)
+                        typeProperties->dataType.pointerFree;
+                    typeProperties->dataType.members[i].namespaceZero = dataTypeList[i]->typeId.namespaceIndex == 0;
+                    typeProperties->dataType.members[i].padding = *padding;
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+                    size_t length = strlen(dataTypeList[i]->typeName);
+                    typeProperties->dataType.members[i].memberName = (char*)UA_malloc((length + 1) * sizeof(char));
+                    strncpy((char*)typeProperties->dataType.members[i].memberName, dataTypeList[i]->typeName, length);
+                    ((char*)typeProperties->dataType.members[i].memberName)[length] = 0x0;
+#endif
+                    padding++;
+                }
+            }
+            else {
+                UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "cannot allocate memory for %.*s", (UA_UInt16)typeProperties->browseName.name.length, typeProperties->browseName.name.data);
+            }
+        }
+        else {
+            typeProperty->second.dataType.memSize = 0;
+        }
+        printTypeProperty(typeProperty);
+        dataTypeList.clear();
+        typeProperty++;
+    }
+    // count valid user data types
+    typeProperty = typePropertiesMap.begin();
+    while (typeProperty != typePropertiesMap.end()) {
+        if (typeProperty->second.dataType.memSize)
+            numberOfUserDataTypes++;
+        typeProperty++;
+    }
+    // build user data types
+    customDataTypes = (UA_DataTypeArray*)UA_malloc(numberOfUserDataTypes * sizeof(UA_DataTypeArray));
+    if (!customDataTypes)
+        return;
+    memset(customDataTypes, 0x0, numberOfUserDataTypes * sizeof(UA_DataTypeArray));
+    typeProperty = typePropertiesMap.begin();
+    UA_UInt32 j = 0;
+    for (size_t i = 0; i < typePropertiesMap.size(); i++) {
+        if (!typeProperty->second.dataType.memSize) {
+            typeProperty++;
+            continue;
+        }
+        //printTypeProperty(typeProperty);
+        customDataTypes[j].types = &typeProperty->second.dataType;
+        *(size_t*)&(customDataTypes[j]).typesSize = 1;
+        if ((i + 1) < typePropertiesMap.size() && (j + 1) < numberOfUserDataTypes)
+            customDataTypes[j].next = &customDataTypes[j + 1];
+        else
+            customDataTypes[j].next = 0x0;
+        j++;
+        typeProperty++;
+    }
+    // configure client session with user data types
+    UA_Client_getConfig(client)->customDataTypes = customDataTypes;
+}
+
+int main(int argc, char* argv[]) {
     const char* uaUrl = "opc.tcp://firing2:48010";//"opc.tcp://127.0.0.1:62541/milo";//"opc.tcp://milo.digitalpetri.com:62541/milo";//
-    const UA_UInt16 numberOfIds = 7;
-    const char id[numberOfIds][255] = { "Demo.Static.Scalar.CarExtras", "Demo.BoilerDemo.Boiler1.HeaterStatus", "Demo.Static.Scalar.OptionSet", "Demo.Static.Scalar.XmlElement", "Demo.Static.Scalar.Structure", "Demo.Static.Scalar.Union", "Demo.Static.Scalar.Structures.AnalogMeasurement" };//"ComplexTypes/CustomStructTypeVariable";//"ComplexTypes/CustomUnionTypeVariable";//"Person1";//"Demo.Static.Scalar.Priority";//"ComplexTypes/CustomEnumTypeVariable";//
+    const UA_UInt16 numberOfIds = 8;
+    const char id[numberOfIds][255] = { "Demo.Static.Scalar.CarExtras" , "Demo.BoilerDemo.Boiler1.HeaterStatus", "Demo.Static.Scalar.OptionSet", "Demo.Static.Scalar.XmlElement", "Demo.Static.Scalar.Structure", "Demo.Static.Scalar.Union", "Demo.Static.Scalar.Structures.AnalogMeasurement", "Person1" };//"ComplexTypes/CustomStructTypeVariable";//"ComplexTypes/CustomUnionTypeVariable";//"Person1";//"Demo.Static.Scalar.Priority";//"ComplexTypes/CustomEnumTypeVariable";//
     UA_NodeId nodeId;
     UA_Client* client = 0x0;
     UA_StatusCode retval = UA_STATUSCODE_BAD;
-    UA_DataType userDataType;
     UA_String out;
     UA_Variant outValue;
-    std::map<std::string, UA_Variant> structureMembers;
-    std::map<UA_UInt32, std::string> dictionaries;
-    std::map<UA_UInt32, std::vector<std::map<std::string, std::string>>> dataTypeAttributes;
 
     if (argc > 1) uaUrl = argv[1];
 
     // pre-initialisation of the user data type
-    userDataType.memSize = 0;
-    userDataType.membersSize = 0;
     // connect to server
     client = UA_Client_new();
     UA_ClientConfig_setDefault(UA_Client_getConfig(client));
@@ -1270,82 +1122,59 @@ int main(int argc, char* argv[]) {
         UA_Client_delete(client);
         return EXIT_FAILURE;
     }
-    // retrieve all dictionaries of OPC UA server
-    if(getDictionaries(client, &dictionaries)) {    
-        //printDictionaries(&dictionaries);
-        // process all given node IDs
-        for (UA_UInt16 i = 0; i < numberOfIds; i++) {
-            nodeId = UA_NODEID_STRING_ALLOC(2, id[i]);
-            // retrieve user data type and user data type attributes
-            retval = getUserDataTypeAttributes(client, nodeId, &dictionaries, &userDataType, &dataTypeAttributes);
-            if (retval == UA_STATUSCODE_UNCERTAIN) { // ENUMERATION
-                UA_Variant_init(&outValue);
-                retval = UA_Client_readValueAttribute(client, nodeId, &outValue);
-                if (retval == UA_STATUSCODE_GOOD) {
-                    UA_printEnum(&outValue, &userDataType, &dataTypeAttributes, &out);
-                    printf("%.*s\n", (UA_UInt16)out.length, out.data);
-                    UA_String_clear(&out);
-                }
-                UA_Variant_clear(&outValue);
-            }
-            else if (retval == UA_STATUSCODE_GOOD)  {
-                //printUserDataTypeAttributes(&dataTypeAttributes, &userDataType);
-                // reconnect with user data types
-                UA_DataType* types;
-                types = (UA_DataType*)UA_malloc(sizeof(UA_DataType));
-                if (!types)
-                    break;
-                types[0] = userDataType;
-                UA_DataTypeArray customDataTypes = { NULL, 1, types };
-                UA_Client_getConfig(client)->customDataTypes = &customDataTypes;
-                // read value
-                UA_Variant_init(&outValue);
-                retval = UA_Client_readValueAttribute(client, nodeId, &outValue);
-                if (retval == UA_STATUSCODE_GOOD) {
-                    UA_String_init(&out);
-                    switch (userDataType.typeKind) {
-                        case (UA_DATATYPEKIND_UNION): {
-                            UA_printUnion(&outValue, &dataTypeAttributes, &out);
-                            break;
-                        }
-                        case (UA_DATATYPEKIND_STRUCTURE): {
-                            getStructureValues(client, outValue, &userDataType, &dataTypeAttributes, &structureMembers);
-                            UA_printStructure(&outValue, &structureMembers, &out);
-                            structureMembers.clear();
-                            break;
-                        }
-                        case (UA_DATATYPEKIND_ENUM): {
-                            break; // handled by getUserDataTypeAttributes() == UA_STATUSCODE_UNCERTAIN
-                        }
-                        default: {
-                            UA_print(&outValue, &UA_TYPES[UA_TYPES_VARIANT], &out);
-                        }
-                    }
-                    printf("%.*s\n", (UA_UInt16)out.length, out.data);
-                    UA_String_clear(&out);
-                }                
+    initializeUserDataTypeIds(client);
+    for (UA_UInt16 i = 0; i < numberOfIds; i++) {
+        nodeId = UA_NODEID_STRING_ALLOC(2, id[i]);
+        // print node ID
+        UA_print(&nodeId, &UA_TYPES[UA_TYPES_NODEID], &out);
+        printf("%.*s: ", (UA_UInt16)out.length, out.data);
+        UA_String_clear(&out);
+        // read value
+        UA_Variant_init(&outValue);
+        retval = UA_Client_readValueAttribute(client, nodeId, &outValue);
+        if (retval == UA_STATUSCODE_GOOD) {
+            // get printable value
+            typeProperty = typePropertiesMap.find(UA_NodeId_hash(&outValue.type->typeId));
+            if (typeProperty == typePropertiesMap.end()) {
+                UA_print(&outValue, &UA_TYPES[UA_TYPES_VARIANT], &out);
+                printf("%.*s\n", (UA_UInt16)out.length, out.data);
+                UA_String_clear(&out);
                 UA_Variant_clear(&outValue);
                 UA_NodeId_clear(&nodeId);
-                UA_free(types);
+                continue;
             }
-            else /*if (retval == UA_STATUSCODE_BAD)*/ { // no user data type was found
-                UA_Variant_init(&outValue);
-                retval = UA_Client_readValueAttribute(client, nodeId, &outValue);
-                if (retval == UA_STATUSCODE_GOOD) {
-                    UA_print(&outValue, &UA_TYPES[UA_TYPES_VARIANT], &out);
-                    printf("%.*s\n", (UA_UInt16)out.length, out.data);
-                    UA_String_clear(&out);
-                }
-                UA_Variant_clear(&outValue);
+            switch (typeProperty->second.dataType.typeKind) {
+            case (UA_DATATYPEKIND_UNION): {
+                UA_printUnion(&outValue, &typeProperty->second.dataType, &out);
+                break;
             }
+            case (UA_DATATYPEKIND_STRUCTURE): {
+                UA_printStructure(&outValue, &typeProperty->second.dataType, &out);
+                break;
+            }
+            case (UA_DATATYPEKIND_ENUM): {
+                UA_printEnum(&outValue, &typeProperty->second.dataType, &out);
+                break;
+            }
+            default: {
+                UA_print(&outValue, &UA_TYPES[UA_TYPES_VARIANT], &out);
+            }
+            }
+            // print value
+            printf("%.*s\n", (UA_UInt16)out.length, out.data);
+            UA_String_clear(&out);
+            UA_Variant_clear(&outValue);
         }
-    } else {
-        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "failed to retrieve dictionaries");
+        else {
+            UA_print(&nodeId, &UA_TYPES[UA_TYPES_NODEID], &out);
+            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "could not read %.*s", (UA_UInt16)out.length, out.data);
+            UA_String_clear(&out);
+        }
+        UA_NodeId_clear(&nodeId);
     }
-    // disconnect and clean up
+    if (customDataTypes)
+        UA_free(customDataTypes);
     UA_Client_disconnect(client);
     UA_Client_delete(client);
-    dataTypeAttributes.clear();
-    dictionaries.clear();
     return EXIT_SUCCESS;
 }
