@@ -35,6 +35,13 @@
 */
 
 #pragma once
+
+#if defined(QUEUE_MACRO_DEBUG) || (defined(_KERNEL) && defined(DIAGNOSTIC))
+#define _Q_INVALIDATE(a) (a) = ((void *)-1)
+#else
+#define _Q_INVALIDATE(a)
+#endif
+
 /*
  * Tail queue definitions.
  */
@@ -139,6 +146,8 @@ struct {								\
     else								\
         (head)->tqh_last = (elm)->field.tqe_prev;		\
     *(elm)->field.tqe_prev = (elm)->field.tqe_next;			\
+    _Q_INVALIDATE((elm)->field.tqe_prev);				\
+    _Q_INVALIDATE((elm)->field.tqe_next);				\
 } while (0)
 
 #define TAILQ_REPLACE(head, elm, elm2, field) do {			\
@@ -149,6 +158,8 @@ struct {								\
         (head)->tqh_last = &(elm2)->field.tqe_next;		\
     (elm2)->field.tqe_prev = (elm)->field.tqe_prev;			\
     *(elm2)->field.tqe_prev = (elm2);				\
+    _Q_INVALIDATE((elm)->field.tqe_prev);				\
+    _Q_INVALIDATE((elm)->field.tqe_next);				\
 } while (0)
 
 #pragma warning(disable : 4200)

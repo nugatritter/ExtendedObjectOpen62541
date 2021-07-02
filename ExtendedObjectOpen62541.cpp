@@ -1,46 +1,468 @@
 /*************************************************************************\
 * Copyright (c) 2021 HZB.
 * Author: Carsten Winkler carsten.winkler@helmholtz-berlin.de
+*
+* All you need to use custom data types is
+*       UA_StatusCode initializeCustomDataTypes(UA_Client* client);
+*
+* How to read custom data types is shown in
+*       UA_StatusCode UA_printValue(UA_Client* client, UA_NodeId nodeId,
+*                                   UA_Variant* data, UA_String* output)
+*
+* You can find a working example in the main function
+* --------------------------------------------------------------------------
+* based on open62541
+*   https://github.com/open62541/open62541/releases/tag/v1.2.2
+*   used options: BUILD_SHARED_LIBS and UA_ENABLE_STATUSCODE_DESCRIPTIONS
+*
+* uses libxml2
+*   Windows
+*     git clone https://gitlab.gnome.org/GNOME/libxml2.git
+*     cscript configure.js compiler=msvc debug=no iconv=no
+*     nmake /f Makefile.msvc
+*
+*   Linux
+*     sudo apt-get install libxml2
+*     sudo apt-get install libxml2-dev(el)
+*
 \*************************************************************************/
 
 #include <open62541/client_config_default.h>
 #include <open62541/client_highlevel.h>
 #include <open62541/plugin/log_stdout.h>
 
-// git clone https://gitlab.gnome.org/GNOME/libxml2.git
-// libxml2\win32>cscript configure.js compiler=msvc debug=no iconv=no
-// libxml2\win32>nmake /f Makefile.msvc
 #include <libxml/parser.h> 
 #include <libxml/tree.h>
 #include <libxml/xpath.h>
+#include <libxml/xpathInternals.h>
 
 #include <algorithm>
-#include <cmath>
 #include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
-#include "TailQueue.h"
 #include "ExtendedObjectOpen62541.h"
-//#ifdef UA_ENABLE_TYPEDESCRIPTION
-//    #undef UA_ENABLE_TYPEDESCRIPTION
-//#endif
+#include "TailQueue.h"
 
-// calculates the additional memory consumption (padding) of structure elements in the RAM
+#pragma warning(disable : 26812)
+#define MEMORY_BANK_SIZE 4
+//#undef UA_ENABLE_TYPEDESCRIPTION // for compatibility check only
+
+static const UA_DataType* parseDataType(std::string text);
+static const UA_UInt32 ADDRESS_SIZE = sizeof(void*);
+static std::string byteStringToString(UA_ByteString* bytes);
+static UA_Boolean isOptionSet(const UA_NodeId* subTypeNodeId);
+static UA_PrintOutput* UA_PrintContext_addOutput(UA_PrintContext* ctx, size_t length);
+UA_StatusCode parseXml(std::map<UA_UInt32, std::string>* dictionaries);
+UA_StatusCode printUInt32(UA_PrintContext* ctx, UA_UInt32 p, UA_UInt32 width = 0, UA_Boolean isHex = false);
+UA_StatusCode scan4BaseDataTypes(UA_Client* client);
+UA_StatusCode UA_PrintContext_addNewlineTabs(UA_PrintContext* ctx, size_t tabs);
+UA_StatusCode UA_PrintContext_addString(UA_PrintContext* ctx, const char* str);
+void scanForTypeIds(UA_BrowseResponse* bResp, std::vector<UA_NodeId>* dataTypeIds, std::vector<UA_NodeId>* cutomDataTypeIds);
+void UA_PrintTypeKind(UA_UInt32 typeKind, UA_String* out);
+
+// this function collects reference type ID, forwarded flag, 
+// browse name, display name, node class and type definition
+// returns true if browse was successful
+UA_StatusCode browseNodeId(UA_Client* client, UA_NodeId nodeId, UA_BrowseResponse* bResp) {
+    UA_BrowseRequest bReq;
+
+    if (!client) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "browseNodeId: Client session invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (!bResp) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "browseNodeId: Parameter 2 (UA_BrowseResponse*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    UA_BrowseRequest_init(&bReq);
+    bReq.requestedMaxReferencesPerNode = 0;
+    bReq.nodesToBrowse = UA_BrowseDescription_new();
+    bReq.nodesToBrowseSize = 1;
+    UA_NodeId_copy(&nodeId, &bReq.nodesToBrowse[0].nodeId);
+    bReq.nodesToBrowse[0].resultMask = UA_BROWSERESULTMASK_ALL; /* return everything */
+    bReq.nodesToBrowse[0].browseDirection = UA_BROWSEDIRECTION_BOTH;
+    *bResp = UA_Client_Service_browse(client, bReq);
+    UA_BrowseRequest_clear(&bReq);
+    return UA_STATUSCODE_GOOD;
+}
+
+// this function converts a byte string to a null terminated string
+static std::string byteStringToString(UA_ByteString* bytes) {
+    if (!bytes)
+        return "";
+    return std::string((char*)bytes->data, bytes->length);
+}
+
+// subfunction of calc_struct_padding
+void sub_calc_struct_padding(UA_Byte bytes, UA_DataTypeMember* dataTypeMember, UA_UInt32* size, UA_Byte* maxVal, UA_Byte* currentMemoryBank, UA_Byte* padding) {
+    if (bytes > *maxVal)
+        *maxVal = bytes;
+    if (bytes > 1 && *currentMemoryBank && bytes + *currentMemoryBank > ADDRESS_SIZE) {
+        *padding = ADDRESS_SIZE - *currentMemoryBank;
+    }
+    else if (bytes > 1 && *currentMemoryBank % 4) {
+        *padding = 4 - *currentMemoryBank;
+    }
+    *currentMemoryBank += bytes + *padding;
+    *size += bytes + *padding;
+    dataTypeMember->padding = *padding;
+    while (*currentMemoryBank > ADDRESS_SIZE)
+        *currentMemoryBank -= ADDRESS_SIZE;
+    if (*currentMemoryBank == ADDRESS_SIZE)
+        *currentMemoryBank = 0;
+}
+
+// calculates the additional memory consumption (padding)
+// of data type members (structure members) in the RAM
 // returns resulting RAM size of whole structure
-// this is a sub function of buildUserDataType
-UA_Byte calc_struct_padding(std::vector<const UA_DataType*>* structMemberTypes, std::vector<UA_Byte>* paddingSegments);
-// retrieves the binary encoding ID of a data type
-// returns true if the binary ID could be retrieved
-UA_StatusCode getBinaryEncodingId(UA_Client* client, UA_NodeId pvId, UA_NodeId* binaryEncodingId);
-// checks whether the xml node is a leaf (child)
-UA_Boolean isLeaf(xmlNode* node);
-// shortcut for warning message; the node ID is printed before the message
-void printWarn(const char* message, UA_NodeId pvId);
-void UA_printNodeClass(UA_NodeClass nodeClass, UA_String* out);
+UA_UInt32 calc_struct_padding(UA_DataType* dataType) {
+    UA_Byte maxVal = 0;
+    UA_UInt32 size = 0;
+    UA_Byte bytes = 0;
+    UA_Byte padding = 0;
+    UA_Byte currentMemoryBank = 0;
+    UA_DataTypeMember* dataTypeMember;
+
+    for (UA_UInt32 i = 0; i < dataType->membersSize; i++) {
+        dataTypeMember = &dataType->members[i];
+        padding = 0;
+        if (dataTypeMember->isOptional)
+            bytes = ADDRESS_SIZE;
+        else if (dataTypeMember->isArray) {
+            bytes = sizeof(size_t);
+            UA_Byte tmpMaxVal = maxVal;
+            UA_Byte tmpCurrentMemoryBank = currentMemoryBank;
+            UA_Byte tmpPadding = padding;
+            sub_calc_struct_padding(bytes, dataTypeMember, &size, &maxVal, &currentMemoryBank, &padding);
+            maxVal = tmpMaxVal;
+            currentMemoryBank = tmpCurrentMemoryBank;
+            padding = tmpPadding;
+            bytes = ADDRESS_SIZE;
+            sub_calc_struct_padding(bytes, dataTypeMember, &size, &maxVal, &currentMemoryBank, &padding);
+        }
+        else
+            bytes = (UA_Byte)UA_TYPES[dataTypeMember->memberTypeIndex].memSize;
+        sub_calc_struct_padding(bytes, dataTypeMember, &size, &maxVal, &currentMemoryBank, &padding);
+    }
+    padding = 0;
+    if (maxVal > MEMORY_BANK_SIZE) {
+        while (currentMemoryBank % ADDRESS_SIZE) {
+            padding++;
+            currentMemoryBank++;
+        }
+    }
+    else if (maxVal > 1) {
+        while (currentMemoryBank % maxVal) {
+            padding++;
+            currentMemoryBank++;
+        }
+    }
+    size += padding;
+    return size;
+}
+
+// initializes the structure customTypeProperties_t
+void customTypePropertiesInit(customTypeProperties_t* customTypeProperties, const UA_NodeId* customDataTypeId) {
+    memset(&customTypeProperties->dataType, 0x0, sizeof(UA_DataType));
+    UA_NodeId_copy(customDataTypeId, &customTypeProperties->dataType.typeId);
+}
+
+// source: https://stackoverflow.com/questions/23943728/case-insensitive-standard-string-comparison-in-c
+static UA_Boolean exo_compare_pred(unsigned char a, unsigned char b) {
+    return std::tolower(a) == std::tolower(b);
+}
+
+// case-insensitive string comparison (WARNING: this is not UTF-8 compatible)
+static UA_Boolean exo_compare(std::string const& a, std::string const& b) {
+    return a.length() == b.length() ? std::equal(b.begin(), b.end(), a.begin(), exo_compare_pred) : false;
+}
+
+// converts ASCII characters in string to lo upper case (WARNING: this is not UTF-8 compatible)
+static std::string exo_toupper(std::string data) {
+    std::for_each(data.begin(), data.end(), [](char& c) {
+        c = ::toupper(c);
+        });
+    return data;
+}
+
+// converts ASCII characters in string to lo lower case (WARNING: this is not UTF-8 compatible)
+static std::string exo_tolower(std::string data) {
+    std::for_each(data.begin(), data.end(), [](char& c) {
+        c = ::tolower(c);
+        });
+    return data;
+}
+
+// case-insensitive string search (WARNING: this is not UTF-8 compatible)
+static size_t exo_find(std::string source, std::string search) {
+    size_t pos;
+    if (source.empty() || search.empty())
+        return std::string::npos;
+    pos = source.find(search);
+    if (pos == std::string::npos)
+        pos = source.find(exo_tolower(search));
+    if (pos == std::string::npos)
+        pos = source.find(exo_toupper(search));
+    return pos;
+}
+
+// case-insensitive string search reverse (WARNING: this is not UTF-8 compatible)
+static size_t exo_rfind(std::string source, std::string search) {
+    size_t pos;
+    if (source.empty() || search.empty())
+        return std::string::npos;
+    pos = source.rfind(search);
+    if (pos == std::string::npos)
+        pos = source.rfind(exo_tolower(search));
+    if (pos == std::string::npos)
+        pos = source.rfind(exo_toupper(search));
+    return pos;
+}
+
+// retrieves all dictionaries of the OPC UA server
+// the result map contains name space and raw XML content of dictionary
+UA_StatusCode getDictionaries(UA_Client* client, std::map<UA_UInt32, std::string>* dictionaries) {
+    UA_ReferenceDescription rDesc;
+    UA_BrowseResponse bResp;
+    UA_UInt16 nameSpaceIndex;
+    UA_StatusCode retval;
+    UA_Variant outValue;
+    size_t found1, found2;
+    std::map<UA_UInt32, std::string>::iterator dictionaryIt;
+
+    if (!client) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "getDictionaries: Client session invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (!dictionaries) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "getDictionaries: Parameter 2 (std::map<UA_UInt32, std::string>*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    dictionaries->clear();
+    retval = browseNodeId(client, UA_NODEID_NUMERIC(0, UA_NS0ID_OPCBINARYSCHEMA_TYPESYSTEM), &bResp);
+    for (size_t i = 0; (retval == UA_STATUSCODE_GOOD) && i < bResp.resultsSize; ++i) {
+        for (size_t j = 0; j < bResp.results[i].referencesSize; ++j) {
+            rDesc = bResp.results[i].references[j];
+            nameSpaceIndex = rDesc.nodeId.nodeId.namespaceIndex;
+            if (nameSpaceIndex != 0) {
+                retval = UA_Client_readValueAttribute(client, rDesc.nodeId.nodeId, &outValue);
+                if ((retval == UA_STATUSCODE_GOOD) && (outValue.type == &UA_TYPES[UA_TYPES_BYTESTRING])) {
+                    std::string rawDictionary = byteStringToString((UA_ByteString*)outValue.data);
+                    dictionaryIt = dictionaries->find(nameSpaceIndex);
+                    // add dictionary to new namespace
+                    if (dictionaryIt == dictionaries->end()) {
+                        dictionaries->insert(std::pair<UA_UInt16, std::string>(nameSpaceIndex, rawDictionary));
+                    }
+                    // append dictionary to known namespace
+                    else {
+                        found1 = exo_rfind(dictionaryIt->second, "</opc:TypeDictionary>");
+                        if (found1 != std::string::npos) {
+                            dictionaryIt->second = dictionaryIt->second.substr(0, found1);
+                            found1 = exo_find(rawDictionary, "<opc:EnumeratedType");
+                            found2 = exo_find(rawDictionary, "<opc:StructuredType");
+                            if (found1 != std::string::npos && found2 != std::string::npos) {
+                                if (found1 < found2)
+                                    rawDictionary = rawDictionary.substr(found1);
+                                else
+                                    rawDictionary = rawDictionary.substr(found2);
+                            }
+                            else if (found1 != std::string::npos) {
+                                rawDictionary = rawDictionary.substr(found1);
+                            }
+                            else if (found2 != std::string::npos) {
+                                rawDictionary = rawDictionary.substr(found2);
+                            }
+                            dictionaryIt->second.append(rawDictionary);
+                        }
+                    }
+                }
+                UA_Variant_clear(&outValue);
+            }
+        }
+    }
+    return retval;
+}
 
 // converts dictionary data type tag to OPC data type address (generated open62541 data types)
-const UA_DataType* parseDataType(std::string text) {
+// checks for sub data types
+const UA_DataType* getMemberDataType(std::string typeName) {
+    const UA_DataType* memberDataType = 0x0;
+    std::size_t found;
+    if (typeName.empty())
+        return memberDataType;
+    memberDataType = parseDataType(typeName);
+    if (!memberDataType) {
+        found = typeName.find_first_of(':');
+        if (found != std::string::npos)
+            typeName = typeName.substr(found + 1);
+        nameTypePropIt_t subTypePropIt = dataTypeNameMap.find(typeName);
+        if (subTypePropIt != dataTypeNameMap.end())
+            memberDataType = &subTypePropIt->second->dataType;
+        else
+            memberDataType = 0x0;
+    }
+    return memberDataType;
+}
+
+void getSubTypeProperties(UA_NodeId* subTypeNodeId, customTypeProperties_t* customTypeProperties) {
+    static UA_UInt32 level = 0;
+    level++;
+    // sub-type is a structure
+    if (UA_NodeId_equal(subTypeNodeId, &NS0ID_STRUCTURE)) {
+        customTypeProperties->dataType.typeKind = UA_DATATYPEKIND_STRUCTURE;
+    }
+    // sub-type is an option set
+    else if (UA_NodeId_equal(subTypeNodeId, &NS0ID_OPTIONSET)) {
+        customTypeProperties->dataType.membersSize = 2;
+        customTypeProperties->dataType.members = (UA_DataTypeMember*)UA_malloc(customTypeProperties->dataType.membersSize * sizeof(UA_DataTypeMember));
+        if (customTypeProperties->dataType.members) {
+            memset(&customTypeProperties->dataType.members[0], 0x0, sizeof(UA_DataTypeMember));
+            customTypeProperties->dataType.members[0].memberTypeIndex = UA_TYPES_BYTESTRING;
+            customTypeProperties->dataType.members[0].namespaceZero = true;
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+            customTypeProperties->dataType.members[0].memberName = (char*)UA_malloc(6 * sizeof(char));
+            if (customTypeProperties->dataType.members[0].memberName)
+                strcpy((char*)customTypeProperties->dataType.members[0].memberName, "Value");
+#endif
+            memset(&customTypeProperties->dataType.members[1], 0x0, sizeof(UA_DataTypeMember));
+            customTypeProperties->dataType.members[1].memberTypeIndex = UA_TYPES_BYTESTRING;
+            customTypeProperties->dataType.members[1].namespaceZero = true;
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+            customTypeProperties->dataType.members[1].memberName = (char*)UA_malloc(10 * sizeof(char));
+            if (customTypeProperties->dataType.members[1].memberName)
+                strcpy((char*)customTypeProperties->dataType.members[1].memberName, "ValidBits");
+#endif
+        }
+        else {
+            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "getSubTypeProperties: could not allocate memory for DataTypeMember");
+            customTypeProperties->dataType.membersSize = 0;
+        }
+        customTypeProperties->dataType.memSize = calc_struct_padding(&customTypeProperties->dataType);
+        customTypeProperties->dataType.overlayable = UA_BINARY_OVERLAYABLE_INTEGER;
+        customTypeProperties->dataType.pointerFree = true;
+        customTypeProperties->dataType.typeIndex = UA_TYPES_BYTESTRING;
+        customTypeProperties->dataType.typeKind = UA_DATATYPEKIND_STRUCTURE;
+    }
+    // sub-type is an UNION
+    else if (UA_NodeId_equal(subTypeNodeId, &NS0ID_UNION)) {
+        customTypeProperties->dataType.typeKind = UA_DATATYPEKIND_UNION;
+        customTypeProperties->dataType.typeIndex = UA_TYPES_SBYTE;
+    }
+    // sub-type is an ENUMERATION
+    else if (UA_NodeId_equal(subTypeNodeId, &NS0ID_ENUMERATION)) {
+        customTypeProperties->dataType.typeKind = UA_DATATYPEKIND_ENUM;
+        customTypeProperties->dataType.typeIndex = UA_TYPES_INT32;
+        customTypeProperties->dataType.memSize = sizeof(UA_Int32);
+        customTypeProperties->dataType.pointerFree = true;
+        customTypeProperties->dataType.overlayable = true;
+    }
+    else {
+        if (level > 100) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "getSubTypeProperties: recursion error");
+            level--;
+            return;
+        }
+        typePropIt_t parentIt = dataTypeMap.find(UA_NodeId_hash(&customTypeProperties->subTypeOfId));
+        if (parentIt != dataTypeMap.end()) {
+            getSubTypeProperties(&parentIt->second.subTypeOfId, customTypeProperties);
+        }
+    }
+    level--;
+}
+
+// reads value of the named property at XML node
+// name is case-insensitive (WARNING: name this is not UTF-8 compatible)
+static std::string getXmlPropery(xmlNode* node, const char* name) {
+    if (!node || !name)
+        return std::string();
+    char* propertyValue = 0x0;
+    std::string retval;
+
+    propertyValue = (char*)xmlGetProp(node, (const xmlChar*)name);
+    if (!propertyValue)
+        propertyValue = (char*)xmlGetProp(node, (const xmlChar*)exo_toupper(name).c_str());
+    if (!propertyValue)
+        propertyValue = (char*)xmlGetProp(node, (const xmlChar*)exo_tolower(name).c_str());
+    if (propertyValue) {
+        retval = std::string(propertyValue);
+        xmlFree(propertyValue);
+    }
+    else {
+        retval = std::string();
+    }
+    return retval;
+}
+
+// search for and implement custom data types of the server
+UA_StatusCode initializeCustomDataTypes(UA_Client* client) {
+    UA_StatusCode retval;
+    std::map<UA_UInt32, std::string> dictionaries;
+    std::map<UA_UInt32, xmlDocPtr> xmlDocMap;
+
+    if (!client) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "initializeCustomDataTypes: Client session invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+
+    // retrieve custom data types from the server node /Types/DataTypes/BaseDataType
+    retval = scan4BaseDataTypes(client);
+    if (retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "initializeCustomDataTypes: Retrieve custom data types from the server node /Types/DataTypes/BaseDataType failed");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+
+    // retrieve OPC UA dictionaries from the server
+    retval = getDictionaries(client, &dictionaries);
+    if (retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "initializeCustomDataTypes: Could not retrieve the OPC UA dictionary");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+
+    retval = parseXml(&dictionaries);
+
+    // initialize client with custom data types
+    numberOfCustomDataTypes = (UA_UInt32)dataTypeMap.size();
+    customDataTypes = (UA_DataTypeArray*)UA_malloc(numberOfCustomDataTypes * sizeof(UA_DataTypeArray));
+    if (!customDataTypes) {
+        numberOfCustomDataTypes = 0;
+        return UA_STATUSCODE_BADOUTOFMEMORY;
+    }
+    memset((void*)customDataTypes, 0x0, numberOfCustomDataTypes * sizeof(UA_DataTypeArray));
+    typePropIt_t dataTypeMapIt = dataTypeMap.begin();
+    for (UA_UInt32 i = 0; dataTypeMapIt != dataTypeMap.end() && i < numberOfCustomDataTypes; dataTypeMapIt++) {
+        if (UA_NodeId_equal(&dataTypeMapIt->second.dataType.typeId, &UA_NODEID_NULL))
+            continue;
+        customDataTypes[i].types = &dataTypeMapIt->second.dataType;
+        *(size_t*)&(customDataTypes[i]).typesSize = 1;
+        if ((i + 1) < numberOfCustomDataTypes)
+            customDataTypes[i].next = &customDataTypes[i + 1];
+        else
+            customDataTypes[i].next = 0x0;
+        i++;
+    }
+    // initialize current client session with new custom data types
+    UA_Client_getConfig(client)->customDataTypes = customDataTypes;
+
+    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "initializeCustomDataTypes: Custom data types initialized");
+    return retval;
+}
+
+// checks whether the SubTypeID is equal to the OptionSetID
+static UA_Boolean isOptionSet(const UA_NodeId* subTypeNodeId) {
+    return UA_NodeId_equal(subTypeNodeId, &NS0ID_OPTIONSET);
+}
+
+// source: https://stackoverflow.com/questions/4654636/how-to-determine-if-a-string-is-a-number-with-c
+bool is_number(const std::string& s) {
+    std::string::const_iterator it = s.begin();
+    while (it != s.end() && std::isdigit(*it)) ++it;
+    return !s.empty() && it == s.end();
+}
+
+// converts dictionary data type tag to OPC data type address (generated open62541 data types)
+static const UA_DataType* parseDataType(std::string text) {
     if (xmlStrncasecmp((const xmlChar*)("opc:String"), (xmlChar*)text.data(), (UA_UInt32)text.length()) == 0)
         return &(UA_TYPES[UA_TYPES_STRING]);
     if (xmlStrncasecmp((const xmlChar*)("opc:Byte"), (xmlChar*)text.data(), (UA_UInt32)text.length()) == 0)
@@ -50,7 +472,7 @@ const UA_DataType* parseDataType(std::string text) {
     if (xmlStrncasecmp((const xmlChar*)("opc:Boolean"), (xmlChar*)text.data(), (UA_UInt32)text.length()) == 0)
         return &(UA_TYPES[UA_TYPES_BOOLEAN]);
     if (xmlStrncasecmp((const xmlChar*)("opc:Bit"), (xmlChar*)text.data(), (UA_UInt32)text.length()) == 0)
-        return &(UA_TYPES[UA_TYPES_BOOLEAN]);
+        return 0x0;// used for bit mask only
     if (xmlStrncasecmp((const xmlChar*)("opc:Int16"), (xmlChar*)text.data(), (UA_UInt32)text.length()) == 0)
         return &(UA_TYPES[UA_TYPES_INT16]);
     if (xmlStrncasecmp((const xmlChar*)("opc:Int32"), (xmlChar*)text.data(), (UA_UInt32)text.length()) == 0)
@@ -93,257 +515,530 @@ const UA_DataType* parseDataType(std::string text) {
         return &(UA_TYPES[UA_TYPES_EXTENSIONOBJECT]);
     if (xmlStrncasecmp((const xmlChar*)("opc:CharArray"), (xmlChar*)text.data(), (UA_UInt32)text.length()) == 0)
         return &(UA_TYPES[UA_TYPES_STRING]);
-    return NULL;
+    return 0x0;
 }
 
-// helper function to print binary values
-void binary_print(UA_Byte value) {
-    printf("%c%c%c%c %c%c%c%c %c%c%c%c %c%c%c%c", value & 0x8000 ? '1' : '0', value & 0x4000 ? '1' : '0', value & 0x2000 ? '1' : '0', value & 0x1000 ? '1' : '0',
-        value & 0x0800 ? '1' : '0', value & 0x0400 ? '1' : '0', value & 0x0200 ? '1' : '0', value & 0x0100 ? '1' : '0',
-        value & 0x0080 ? '1' : '0', value & 0x0040 ? '1' : '0', value & 0x0020 ? '1' : '0', value & 0x0010 ? '1' : '0',
-        value & 0x0008 ? '1' : '0', value & 0x0004 ? '1' : '0', value & 0x0002 ? '1' : '0', value & 0x0001 ? '1' : '0');
-}
-
-// this function collects reference type ID, forwarded flag, 
-// browse name, display name, node class and type definition
-// retuns true if browse was successful
-UA_StatusCode browseNodeId(UA_Client* client, UA_NodeId nodeId, UA_BrowseResponse* bResp) {
-    if (!client) {
-        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "client session invalid");
-        return UA_STATUSCODE_BAD;
+// reads xml nodes of the dictionary and extracts a data structure including its members
+// and calculates memory padding in data structure for RAM instances
+UA_StatusCode parseXml(std::map<UA_UInt32, std::string>* dictionaries) {
+    if (!dictionaries) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "getXmlDocMap: Parameter 1 (std::map<UA_UInt32, std::string>*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
     }
-    UA_BrowseRequest bReq;
-    UA_BrowseRequest_init(&bReq);
-    bReq.requestedMaxReferencesPerNode = 0;
-    bReq.nodesToBrowse = UA_BrowseDescription_new();
-    bReq.nodesToBrowseSize = 1;
-    UA_NodeId_copy(&nodeId, &bReq.nodesToBrowse[0].nodeId);
-    bReq.nodesToBrowse[0].resultMask = UA_BROWSERESULTMASK_ALL; /* return everything */
-    bReq.nodesToBrowse[0].browseDirection = UA_BROWSEDIRECTION_FORWARD;
-    *bResp = UA_Client_Service_browse(client, bReq);
-    UA_BrowseRequest_clear(&bReq);
+    const UA_UInt16 xmlPathCount = 2;
+    const char xmlPath[xmlPathCount][40] = { "/opc:TypeDictionary/opc:StructuredType" , "/opc:TypeDictionary/opc:EnumeratedType" };
+    char** tmp, * pError;
+    const UA_DataType* memberDataType;
+    UA_DataTypeMember* member;
+    nameTypePropIt_t typePropIt;
+    std::map<UA_UInt32, std::string>::iterator it;
+    std::string browseName;
+    std::string lengthField;
+    std::string name;
+    std::string propertyName;
+    std::string propertyType;
+    std::string propertyValue;
+    std::string switchField;
+    std::string switchValue;
+    std::string typeName;
+    std::string val;
+    std::string value;
+    std::vector<UA_DataTypeMember> structMemberTypes;
+    UA_Boolean isArray;
+    UA_Boolean isOptional;
+    UA_DataType* dataType;
+    UA_UInt32 maxSize;
+    xmlDocPtr doc;
+    xmlXPathContextPtr xpathCtx;
+    xmlXPathObjectPtr xpathObj;
+
+    // collects custom data type properties of all specified dictionaries
+    for (it = dictionaries->begin(); it != dictionaries->end(); ++it) {
+        // parse the current dictionary and build a node tree
+        doc = xmlReadMemory((const char*)it->second.c_str(), (UA_UInt32)it->second.length(), "include.xml", 0x0, 0);
+        if (!doc) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: Could not read all dictionaries");
+            return UA_STATUSCODE_BADUNEXPECTEDERROR;
+        }
+        // create a new context of XPath
+        xpathCtx = xmlXPathNewContext(doc);
+        if (!xpathCtx) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: Create new XPath instance failed");
+            return UA_STATUSCODE_BADUNEXPECTEDERROR;
+        }
+        // register namespace "opc"
+        if (xmlXPathRegisterNs(xpathCtx, BAD_CAST "opc", BAD_CAST "http://opcfoundation.org/BinarySchema/")) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: Registration of the new namespace \"opc\" of XPath failed");
+            return UA_STATUSCODE_BADUNEXPECTEDERROR;
+        }
+        // process all specified XML paths
+        for (UA_UInt16 i = 0; i < xmlPathCount; i++) {
+            // evaluate current XML path
+            xpathObj = xmlXPathEvalExpression(BAD_CAST xmlPath[i], xpathCtx);
+            if (!xpathObj) {
+                UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: XPath evaluation function failed for %s.", xmlPath[i]);
+                return UA_STATUSCODE_BADUNEXPECTEDERROR;
+            }
+            if (!xpathObj->nodesetval)
+                continue;
+            for (UA_UInt16 j = 0; j < xpathObj->nodesetval->nodeNr; j++) {
+                xmlNode* node = xpathObj->nodesetval->nodeTab[j];
+                xmlNode* children = node->children;
+                isArray = false;
+                isOptional = false;
+                propertyType = (char*)node->name;
+                browseName = (char*)xmlGetProp(node, BAD_CAST "Name");
+                typePropIt = dataTypeNameMap.find(browseName);
+                if (typePropIt == dataTypeNameMap.end()) {
+                    UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: custom data type %s not found in the node branch DataTypes", browseName.c_str());
+                    continue;
+                }
+                dataType = &typePropIt->second->dataType;
+                structMemberTypes.clear();
+                // processing of OptionSets
+                if (isOptionSet(&typePropIt->second->subTypeOfId)) {
+                    // nothing to do
+                }
+                // processing of structures information of the XML node such as
+                // simple structures, structures with optional fields, and unions
+                else if (exo_compare(propertyType, "StructuredType")) {
+                    // check for structure with optional fields
+                    typeName.clear();
+                    switchField.clear();
+                    while (children) {
+                        if (children->type != XML_ELEMENT_NODE || !exo_compare((char*)children->name, "Field")) {
+                            children = children->next;
+                            continue;
+                        }
+                        if (typeName.empty()) {
+                            val = getXmlPropery(children, "TypeName");
+                            if (!val.empty() && exo_compare(val, "opc:Bit"))
+                                typeName = val;
+                        }
+                        if (switchField.empty()) {
+                            val = getXmlPropery(children, "SwitchField");
+                            if (!val.empty())
+                                switchField = val;
+                        }
+                        if (!typeName.empty() && !switchField.empty()) {
+                            dataType->typeKind = UA_DATATYPEKIND_OPTSTRUCT;
+                            break;
+                        }
+                        children = children->next;
+                    }
+                    children = node->children;
+                    // processing of simple structures
+                    if (dataType->typeKind == UA_DATATYPEKIND_STRUCTURE) {
+                        while (children) {
+                            isArray = false;
+                            lengthField.clear();
+                            name.clear();
+                            typeName.clear();
+                            if (children->type != XML_ELEMENT_NODE || !exo_compare((char*)children->name, "Field")) {
+                                children = children->next;
+                                continue;
+                            }
+                            val = getXmlPropery(children, "Name");
+                            if (!val.empty())
+                                name = val;
+                            val = getXmlPropery(children, "TypeName");
+                            if (!val.empty())
+                                typeName = val;
+                            val = getXmlPropery(children, "LengthField");
+                            if (!val.empty())
+                                lengthField = val;
+                            if (!lengthField.empty())
+                                isArray = true;
+                            if (!typeName.empty())
+                                memberDataType = getMemberDataType(typeName);
+                            else
+                                memberDataType = 0x0;
+                            if (!memberDataType) {
+                                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: %s::%s not found", browseName.c_str(), typeName.c_str());
+                                children = children->next;
+                                continue;
+                            }
+                            if (memberDataType->typeIndex > UA_TYPES_DOUBLE)
+                                dataType->pointerFree = false;
+                            UA_DataTypeMember dataTypeMember;
+                            memset(&dataTypeMember, 0x0, sizeof(UA_DataTypeMember));
+                            dataTypeMember.memberTypeIndex = memberDataType->typeIndex;
+                            if (memberDataType->typeId.namespaceIndex && memberDataType->typeKind == UA_DATATYPEKIND_ENUM) {
+                                dataTypeMember.namespaceZero = 1;
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+                                name = std::to_string(UA_NodeId_hash(&memberDataType->typeId));
+                                tmp = (char**)&dataTypeMember.memberName;
+                                *tmp = (char*)UA_malloc(name.length() * sizeof(char) + 1);
+                                if (*tmp)
+                                    strcpy(*tmp, name.c_str());
+#endif
+                            }
+                            else {
+                                dataTypeMember.namespaceZero = memberDataType->typeId.namespaceIndex == 0;
+                            }
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+                            if (!dataTypeMember.memberName) {
+                                tmp = (char**)&dataTypeMember.memberName;
+                                *tmp = (char*)UA_malloc(name.length() * sizeof(char) + 1);
+                                if (*tmp)
+                                    strcpy(*tmp, name.c_str());
+                            }
+#endif
+                            dataTypeMember.isOptional = false;
+                            dataTypeMember.isArray = isArray;
+                            structMemberTypes.push_back(dataTypeMember);
+                            children = children->next;
+                        }
+                    }
+                    // processing of structures with optional fields
+                    else if (dataType->typeKind == UA_DATATYPEKIND_OPTSTRUCT) {
+                        while (children) {
+                            isArray = false;
+                            isOptional = false;
+                            lengthField.clear();
+                            name.clear();
+                            switchField.clear();
+                            typeName.clear();
+                            if (children->type != XML_ELEMENT_NODE || !exo_compare((char*)children->name, "Field")) {
+                                children = children->next;
+                                continue;
+                            }
+                            val = getXmlPropery(children, "TypeName");
+                            if (!val.empty()) {
+                                typeName = val;
+                                if (exo_compare(typeName, "opc:Bit")) {
+                                    children = children->next;
+                                    continue;
+                                }
+                            }
+                            val = getXmlPropery(children, "Name");
+                            if (!val.empty())
+                                name = val;
+                            val = getXmlPropery(children, "SwitchField");
+                            if (!val.empty())
+                                switchField = val;
+                            val = getXmlPropery(children, "LengthField");
+                            if (!val.empty())
+                                lengthField = val;
+                            if (!switchField.empty())
+                                isOptional = true;
+                            if (!lengthField.empty())
+                                isArray = true;
+                            if (!typeName.empty())
+                                memberDataType = getMemberDataType(typeName);
+                            else
+                                memberDataType = 0x0;
+                            if (!memberDataType) {
+                                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: %s::%s not found", browseName.c_str(), typeName.c_str());
+                                children = children->next;
+                                continue;
+                            }
+                            if (memberDataType->typeIndex > UA_TYPES_DOUBLE)
+                                dataType->pointerFree = false;
+                            UA_DataTypeMember dataTypeMember;
+                            memset(&dataTypeMember, 0x0, sizeof(UA_DataTypeMember));
+                            dataTypeMember.memberTypeIndex = memberDataType->typeIndex;
+                            dataTypeMember.namespaceZero = memberDataType->typeId.namespaceIndex == 0 || memberDataType->typeKind == UA_DATATYPEKIND_ENUM;
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+                            tmp = (char**)&dataTypeMember.memberName;
+                            *tmp = (char*)UA_malloc(name.length() * sizeof(char) + 1);
+                            if (*tmp)
+                                strcpy(*tmp, name.c_str());
+#endif
+                            dataTypeMember.isOptional = isOptional;
+                            dataTypeMember.isArray = isArray;
+                            structMemberTypes.push_back(dataTypeMember);
+                            children = children->next;
+                        }
+                    }
+                    // processing of UNION-structures
+                    else if (dataType->typeKind == UA_DATATYPEKIND_UNION) {
+                        while (children) {
+                            isArray = false;
+                            lengthField.clear();
+                            name.clear();
+                            switchField.clear();
+                            switchValue.clear();
+                            typeName.clear();
+                            if (children->type != XML_ELEMENT_NODE || !exo_compare((char*)children->name, "Field")) {
+                                children = children->next;
+                                continue;
+                            }
+                            val = getXmlPropery(children, "TypeName");
+                            if (!val.empty()) {
+                                typeName = val;
+                                if (exo_compare(typeName, "opc:Bit")) {
+                                    children = children->next;
+                                    continue;
+                                }
+                            }
+                            val = getXmlPropery(children, "Name");
+                            if (!val.empty())
+                                name = val;
+                            val = getXmlPropery(children, "SwitchField");
+                            if (!val.empty())
+                                switchField = val;
+                            val = getXmlPropery(children, "SwitchValue");
+                            if (!val.empty())
+                                switchValue = val;
+                            if (!lengthField.empty())
+                                isArray = true;
+                            if (!typeName.empty())
+                                memberDataType = getMemberDataType(typeName);
+                            else
+                                memberDataType = 0x0;
+                            if (!memberDataType) {
+                                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: %s::%s not found", browseName.c_str(), typeName.c_str());
+                                children = children->next;
+                                continue;
+                            }
+                            if (memberDataType->typeIndex > UA_TYPES_DOUBLE)
+                                dataType->pointerFree = false;
+                            UA_DataTypeMember dataTypeMember;
+                            memset(&dataTypeMember, 0x0, sizeof(UA_DataTypeMember));
+                            dataTypeMember.memberTypeIndex = memberDataType->typeIndex;
+                            dataTypeMember.namespaceZero = memberDataType->typeId.namespaceIndex == 0 || memberDataType->typeKind == UA_DATATYPEKIND_ENUM;
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+                            tmp = (char**)&dataTypeMember.memberName;
+                            *tmp = (char*)UA_malloc(name.length() * sizeof(char) + 1);
+                            if (*tmp)
+                                strcpy(*tmp, name.c_str());
+#endif
+                            dataTypeMember.isOptional = isOptional;
+                            dataTypeMember.isArray = isArray;
+                            structMemberTypes.push_back(dataTypeMember);
+                            children = children->next;
+                        }
+                    }
+                    else {
+                        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: custom data type %s structure not found in the node branch DataTypes", browseName.c_str());
+                    }
+                }
+                // processing of enumerations if no declaration was previously available
+                else if (exo_compare(propertyType, "EnumeratedType") && typePropIt->second->enumValueSet.empty()) {
+                    while (children) {
+                        UA_EnumValueType enumValue;
+                        UA_EnumValueType_init(&enumValue);
+                        name.clear();
+                        value.clear();
+                        if (children->type != XML_ELEMENT_NODE || !exo_compare((char*)children->name, "EnumeratedValue")) {
+                            children = children->next;
+                            continue;
+                        }
+                        val = getXmlPropery(children, "Name");
+                        if (!val.empty()) {
+                            name = val;
+                        }
+                        val = getXmlPropery(children, "Value");
+                        if (!val.empty()) {
+                            value = val;
+                        }
+                        if (!name.empty() && !value.empty()) {
+                            long i = strtol(val.c_str(), &pError, 10);
+                            if (val.c_str() != pError) {
+                                enumValue.value = i;
+                                enumValue.description.text = UA_STRING_ALLOC(name.c_str());
+                                enumValue.displayName.text = UA_STRING_ALLOC(name.c_str());
+                                typePropIt->second->enumValueSet.push_back(enumValue);
+                            }
+                        }
+                        children = children->next;
+                    }
+                }
+                // finalize completion of the custom data type
+                if (!structMemberTypes.empty()) {
+                    // convert structure arrays to valid format first
+                    if (dataType->typeKind == UA_DATATYPEKIND_STRUCTURE || dataType->typeKind == UA_DATATYPEKIND_OPTSTRUCT) {
+                        std::vector<UA_DataTypeMember>::iterator prevMmemberIt;
+                        // trim arrays (opc:Int32 + opc:DATATYPE => opc:DATATYPE)
+                        for (std::vector<UA_DataTypeMember>::iterator memberIt = structMemberTypes.begin(); memberIt != structMemberTypes.end();) {
+                            if (memberIt->isArray && prevMmemberIt != structMemberTypes.end()) {
+                                memberIt = structMemberTypes.erase(prevMmemberIt);
+                                if (memberIt != structMemberTypes.end()) {
+                                    prevMmemberIt = structMemberTypes.end();
+                                    memberIt++;
+                                }
+                            }
+                            else {
+                                prevMmemberIt = memberIt;
+                                memberIt++;
+                            }
+                        }
+                    }
+                    // create missing DataTypeMembers
+                    if (!dataType->members) {
+                        dataType->membersSize = structMemberTypes.size();
+                        dataType->members = (UA_DataTypeMember*)UA_malloc(dataType->membersSize * sizeof(UA_DataTypeMember));
+                        memset(dataType->members, 0x0, dataType->membersSize * sizeof(UA_DataTypeMember));
+                    }
+                    // filling in the user data type
+                    if (dataType->members) {
+                        // UNION
+                        if (dataType->typeKind == UA_DATATYPEKIND_UNION && structMemberTypes.size() > 1) {
+                            UA_DataType memoryCheckUnion;
+                            memset(&memoryCheckUnion, 0x0, sizeof(UA_DataType));
+                            memoryCheckUnion.membersSize = 2;
+                            memoryCheckUnion.members = (UA_DataTypeMember*)UA_malloc(memoryCheckUnion.membersSize * sizeof(UA_DataTypeMember));
+                            if (!memoryCheckUnion.members) {
+                                UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: could not allocate memory for data members of memoryCheckUnion");
+                                return UA_STATUSCODE_BADOUTOFMEMORY;
+                            }
+                            memset(memoryCheckUnion.members, 0x0, memoryCheckUnion.membersSize * sizeof(UA_DataTypeMember));
+                            memoryCheckUnion.members[0].memberTypeIndex = structMemberTypes.at(0).memberTypeIndex;
+                            memoryCheckUnion.members[0].namespaceZero = structMemberTypes.at(0).namespaceZero;
+                            dataType->membersSize = structMemberTypes.size() - 1;
+                            UA_DataTypeMember* tmp = (UA_DataTypeMember*)UA_realloc(dataType->members, dataType->membersSize * sizeof(UA_DataTypeMember));
+                            if (!tmp) {
+                                UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: could not allocate memory for data members of %s", browseName.c_str());
+                                return UA_STATUSCODE_BADOUTOFMEMORY;
+                            }
+                            dataType->members = tmp;
+                            memset(dataType->members, 0x0, dataType->membersSize * sizeof(UA_DataTypeMember));
+                            maxSize = 0;
+                            for (UA_UInt32 i = 1; i < structMemberTypes.size(); i++) {
+                                dataType->members[i - 1].isArray = structMemberTypes.at(i).isArray;
+                                dataType->members[i - 1].isOptional = structMemberTypes.at(i).isOptional;
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+                                if (*structMemberTypes.at(i).memberName) {
+                                    dataType->members[i - 1].memberName = (char*)UA_malloc(strlen(structMemberTypes.at(i).memberName) * sizeof(char) + 1);
+                                    strcpy((char*)dataType->members[i - 1].memberName, structMemberTypes.at(i).memberName);
+                                }
+#endif
+                                dataType->members[i - 1].memberTypeIndex = structMemberTypes.at(i).memberTypeIndex;
+                                dataType->members[i - 1].namespaceZero = structMemberTypes.at(i).namespaceZero;
+                                dataType->members[i - 1].padding = 0;
+                                if (UA_TYPES[dataType->members[i - 1].memberTypeIndex].memSize > maxSize) {
+                                    maxSize = UA_TYPES[dataType->members[i - 1].memberTypeIndex].memSize;
+                                    memoryCheckUnion.members[1].memberTypeIndex = dataType->members[i - 1].memberTypeIndex;
+                                    memoryCheckUnion.members[1].namespaceZero = dataType->members[i - 1].namespaceZero;
+                                }
+                            }
+                            dataType->memSize = calc_struct_padding(&memoryCheckUnion);
+                            for (UA_UInt32 i = 1; i < structMemberTypes.size(); i++)
+                                dataType->members[i - 1].padding = UA_TYPES[memoryCheckUnion.members[0].memberTypeIndex].memSize + memoryCheckUnion.members[1].padding;
+                            dataType->typeIndex = UA_TYPES_SBYTE;
+                        }
+                        // STRUCTURE and STRUCTURE WITH OPTIONAL FIELDS
+                        else if (dataType->typeKind == UA_DATATYPEKIND_STRUCTURE || dataType->typeKind == UA_DATATYPEKIND_OPTSTRUCT) {
+                            for (UA_UInt32 i = 0; i < structMemberTypes.size(); i++) {
+                                member = &structMemberTypes.at(i);
+                                dataType->members[i].isOptional = member->isOptional;
+                                dataType->members[i].isArray = member->isArray;
+                                dataType->members[i].memberTypeIndex = member->memberTypeIndex;
+                                dataType->members[i].namespaceZero = member->namespaceZero;
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+                                if (member->memberName) {
+                                    dataType->members[i].memberName = (char*)UA_malloc(strlen(member->memberName) * sizeof(char*) + 1);
+                                    if (dataType->members[i].memberName)
+                                        strcpy((char*)dataType->members[i].memberName, member->memberName);
+                                }
+#endif
+                            }
+                            dataType->memSize = calc_struct_padding(dataType);
+                            dataType->typeIndex = UA_TYPES_EXTENSIONOBJECT;
+                        }
+                    }
+                    else {
+                        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "parseXml: could not allocate memory for data type members of %s", browseName.c_str());
+                        dataType->membersSize = 0;
+                    }
+                }
+            }
+        }
+    }
     return UA_STATUSCODE_GOOD;
 }
 
-// this function converts a byte string to a null terminated string
-// you have to delete the allocated memory of the returned string
-char* byteStringToString(UA_ByteString* bytes) {
-    if (!bytes)
-        return NULL;
-    size_t bufferSize = bytes->length;
-    char* str = new char[bufferSize + 1];
-    memcpy(str, bytes->data, bufferSize);
-    *(str + bufferSize) = 0x0;
-    return str;
-}
+// copy of open62541/src/ua_types_print.c
+UA_StatusCode printArray(UA_PrintContext* ctx, const void* p, const size_t length, const UA_DataType* type) {
+    UA_StatusCode retval;
+    UA_PrintOutput* out;
+    UA_String outString;
 
-// helper function to remove name space offset
-// returns the real name space index
-UA_UInt32 getNameSpaceIndex(UA_UInt32 dictMapIndex) {
-    return (dictMapIndex - (UA_UInt32)floor((UA_Double)dictMapIndex / UA_NAMESPACEOFFSET) * UA_NAMESPACEOFFSET);
-}
-
-// retrieves all dictionaries of the OPC UA server
-UA_Int16 getDictionaries(UA_Client* client, std::map<UA_UInt32, std::string>* dictionaries) {
-    if (!client) {
-        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "client session invalid");
-        return 0;
-    }
-    UA_ReferenceDescription rDesc;
-    UA_BrowseResponse bResp;
-    dictionaries->clear();
-    browseNodeId(client, UA_NODEID_NUMERIC(0, UA_NS0ID_OPCBINARYSCHEMA_TYPESYSTEM), &bResp);
-    for (size_t i = 0; i < bResp.resultsSize; ++i) {
-        for (size_t j = 0; j < bResp.results[i].referencesSize; ++j) {
-            rDesc = bResp.results[i].references[j];
-#ifdef EXO_USER_DICIONARIES_ONLY
-            if (rDesc.nodeId.nodeId.namespaceIndex != 0) {
-#endif // EXO_USER_DICIONARIES_ONLY            
-                UA_Variant outValue;
-                UA_Client_readValueAttribute(client, rDesc.nodeId.nodeId, &outValue);
-                if (outValue.type == &UA_TYPES[UA_TYPES_BYTESTRING]) {
-                    char* str = byteStringToString((UA_ByteString*)outValue.data);
-                    dictionaries->insert(std::pair<UA_UInt32, std::string>((UA_UInt32)(j * UA_NAMESPACEOFFSET + rDesc.nodeId.nodeId.namespaceIndex), std::string(str)));
-                    delete str;
-                }
-                UA_Variant_clear(&outValue);
-#ifdef EXO_USER_DICIONARIES_ONLY
-            }
-#endif // EXO_USER_DICIONARIES_ONLY  
-        }
-    }
-    return (UA_Int16)dictionaries->size();
-}
-
-// prints dictionaries of the OPC UA server
-// use the getDictionaries function to retrieve them
-void printDictionaries(std::map<UA_UInt32, std::string>* dictionaries) {
-    std::map<UA_UInt32, std::string>::iterator it;
-    for (it = dictionaries->begin(); it != dictionaries->end(); ++it) {
-        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "namespace: %d", getNameSpaceIndex(it->first));
-        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%s", it->second.c_str());
-    }
-}
-
-// search for a OPC UA browse name in an xml node of the dictionary
-// writes the found node into the result
-// returns true if the tag has been found
-UA_Boolean findBrowseName(xmlNode* node, UA_String browseName, xmlNode** result) {
-    if (!node || !browseName.length || !result)
-        return UA_FALSE;
-    UA_Boolean found = UA_FALSE;
-    while (node) {
-        if (node->type == XML_ELEMENT_NODE) {
-            if (!isLeaf(node)) {
-                char* nodeName = (char*)node->name;
-                char* attributeName = (char*)xmlGetProp(node, (xmlChar*)"Name");
-                if (nodeName && attributeName) {
-                    if (strncmp(attributeName, (char*)browseName.data, strlen(attributeName)) == 0 && (strstr(nodeName, "EnumeratedType") || strstr(nodeName, "StructuredType"))) {
-                        *result = node;
-                        found = UA_TRUE;
-                        xmlFree(attributeName);
-                        break;
-                    }
-                    xmlFree(attributeName);
-                }
-            }
-        }
-        found = findBrowseName(node->children, browseName, result);
-        node = node->next;
-    }
-    return found;
-}
-
-// this function collects all properties of a xml node
-void collectProperties(xmlNode* node, std::vector<std::map<std::string, std::string>>* vec, UA_Boolean isParent) {
-    if (!node || !vec || vec->empty())
-        return;
-    _xmlAttr* attr;
-    if (isParent) {
-        std::map<std::string, std::string>* map;
-        map = &(*vec->begin());
-        if (!map || map->empty())
-            return;
-        map->insert(std::pair<std::string, std::string>(std::string(EXO_DATATYPE), std::string((char*)node->name)));
-        if (strstr((char*)node->name, "StructuredType")) {
-            map->insert(std::pair<std::string, std::string>(std::string(EXO_DATATYPE_NS0ID), std::string(std::to_string(UA_NS0ID_STRUCTUREDEFINITION))));
-        }
-        else if (strstr((char*)node->name, "EnumeratedType")) {
-            map->insert(std::pair<std::string, std::string>(std::string(EXO_DATATYPE_NS0ID), std::string(std::to_string(UA_NS0ID_ENUMDEFINITION))));
-        }
-        else {
-            map->insert(std::pair<std::string, std::string>(std::string(EXO_DATATYPE_NS0ID), std::string("0")));
-        }
-        xmlChar* value = xmlGetProp(node, BAD_CAST"EXO_BASEDATATYPE");
-        if (value)
-            map->insert(std::pair<std::string, std::string>(EXO_BASEDATATYPE, std::string((char*)value)));
-        else
-            map->insert(std::pair<std::string, std::string>(EXO_BASEDATATYPE, std::string("")));
-        return;
-    }
-    while (node) {
-        if (node->type == XML_ELEMENT_NODE) {
-            attr = node->properties;
-            std::map<std::string, std::string> map = std::map<std::string, std::string>();
-            while (attr) {
-                xmlChar* value = xmlGetProp(node, attr->name);
-                auto pair = std::pair<std::string, std::string>(std::string((char*)attr->name), std::string((char*)value));
-                map.insert(pair);
-                xmlFree(value);
-                attr = attr->next;
-            }
-            vec->push_back(map);
-        }
-        node = node->next;
-    }
-}
-
-// retrieves the binary encoding ID of a data type
-// returns true if the binary ID could be retrieved
-UA_StatusCode getBinaryEncodingId(UA_Client* client, UA_NodeId pvId, UA_NodeId* binaryEncodingId) {
-    if (!client) {
-        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "client session invalid");
-        return UA_STATUSCODE_BAD;
-    }
-    if (!binaryEncodingId) {
-        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "binaryEncodingId must not be NULL");
-        return UA_STATUSCODE_BAD;
-    }
-    UA_Variant outValue;
-    UA_ExtensionObject* data;
-    UA_StatusCode retval = UA_Client_readValueAttribute(client, pvId, &outValue);
-    if (retval != UA_STATUSCODE_GOOD) {
-        printWarn("failed to read value attributes", pvId);
+    retval = UA_STATUSCODE_GOOD;
+    if (!p) {
+        retval |= UA_PrintContext_addString(ctx, "(");
+        retval |= UA_PrintContext_addString(ctx, type->typeName);
+        retval |= UA_PrintContext_addString(ctx, " [empty])");
         return retval;
     }
-    if (outValue.type->typeIndex != UA_TYPES_EXTENSIONOBJECT) {
-        printWarn("has no data type index for extension object", pvId);
-        return UA_STATUSCODE_BAD;
+
+    UA_UInt32 length32 = (UA_UInt32)length;
+    retval |= UA_PrintContext_addString(ctx, "(");
+    retval |= UA_PrintContext_addString(ctx, type->typeName);
+    retval |= UA_PrintContext_addString(ctx, "[");
+    retval |= printUInt32(ctx, length32);
+    retval |= UA_PrintContext_addString(ctx, "]) {");
+    ctx->depth++;
+    uintptr_t target = (uintptr_t)p;
+    for (UA_UInt32 i = 0; i < length; i++) {
+        UA_PrintContext_addNewlineTabs(ctx, ctx->depth);
+        printUInt32(ctx, i);
+        retval |= UA_PrintContext_addString(ctx, ": ");
+        UA_print((const void*)target, type, &outString);
+        out = UA_PrintContext_addOutput(ctx, outString.length);
+        if (!out)
+            retval |= UA_STATUSCODE_BADOUTOFMEMORY;
+        else
+            memcpy(&out->data, outString.data, outString.length);
+        UA_String_clear(&outString);
+        if (i < length - 1)
+            retval |= UA_PrintContext_addString(ctx, ",");
+        target += type->memSize;
     }
-    data = (UA_ExtensionObject*)outValue.data;
-    retval = UA_NodeId_copy(&data->content.encoded.typeId, binaryEncodingId);
+    ctx->depth--;
+    UA_PrintContext_addNewlineTabs(ctx, ctx->depth);
+    retval |= UA_PrintContext_addString(ctx, "}");
     return retval;
 }
 
-// retrieves the data type ID of a node ID
-// returns true if successfully
-UA_StatusCode getTypeId(UA_Client* client, UA_NodeId pvId, UA_NodeId* pvTypeId) {
-    if (!client) {
-        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "client session invalid");
-        return UA_STATUSCODE_BAD;
+// copy of open62541/src/ua_types_print.c
+// modifications: new optional parameters width (leading white spaces) and isHex (print value 
+UA_StatusCode printUInt32(UA_PrintContext* ctx, UA_UInt32 p, UA_UInt32 width, UA_Boolean isHex) {
+    char out[32];
+    if (isHex)
+        snprintf(out, 32, "%0*x", width, p);
+    else
+        snprintf(out, 32, "%0*u", width, p);
+    return UA_PrintContext_addString(ctx, out);
+}
+
+// copy of open62541/src/ua_types_print.c
+UA_StatusCode UA_PrintContext_addName(UA_PrintContext* ctx, const char* name) {
+    if (!name) {
+        UA_PrintOutput* out = UA_PrintContext_addOutput(ctx, 3);
+        if (!out)
+            return UA_STATUSCODE_BADOUTOFMEMORY;
+        memcpy(&out->data, "???", 3);
+        return UA_STATUSCODE_GOOD;
     }
-    return UA_Client_readDataTypeAttribute(client, pvId, pvTypeId);
-}
-
-// converts raw OPC UA dictionaries to xml documents
-void getXmlDocMap(std::map<UA_UInt32, std::string>* dictionaries, std::map<UA_UInt32, xmlDocPtr>* docs) {
-    if (!docs)
-        return;
-    xmlDocPtr doc;
-    std::map<UA_UInt32, std::string>::iterator it;
-    for (it = dictionaries->begin(); it != dictionaries->end(); ++it) {
-        doc = xmlReadMemory((const char*)it->second.c_str(), (UA_UInt32)it->second.length(), "include.xml", NULL, 0);
-        if (doc != NULL) {
-            docs->insert(std::pair<UA_UInt32, xmlDocPtr>(it->first, doc));
-        }
+    else {
+        size_t nameLen = strlen(name);
+        UA_PrintOutput* out = UA_PrintContext_addOutput(ctx, nameLen + 2);
+        if (!out)
+            return UA_STATUSCODE_BADOUTOFMEMORY;
+        memcpy(&out->data, name, nameLen);
+        out->data[nameLen] = ':';
+        out->data[nameLen + 1] = ' ';
+        return UA_STATUSCODE_GOOD;
     }
 }
 
-// checks whether the xml node is a leaf (child)
-UA_Boolean isLeaf(xmlNode* node) {
-    if (!node)
-        return UA_FALSE;
-    xmlNode* child = node->children;
-    while (child) {
-        if (child->type == XML_ELEMENT_NODE) return UA_FALSE;
-        child = child->next;
-    }
-    return UA_TRUE;
-}
-
-// shortcut for warning message; the node ID is printed before the message
-void printWarn(const char* message, UA_NodeId pvId) {
-    UA_String out;
-    UA_print(&pvId, &UA_TYPES[UA_TYPES_NODEID], &out);
-    UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "%.*s %s ", (UA_UInt32)out.length, out.data, message);
-    UA_String_clear(&out);
-}
-
-// helper function of tail queue
+// copy of open62541/src/ua_types_print.c
 static UA_PrintOutput* UA_PrintContext_addOutput(UA_PrintContext* ctx, size_t length) {
     /* Protect against overlong output in pretty-printing */
     if (length > 2 << 16)
-        return NULL;
+        return 0x0;
     UA_PrintOutput* output = (UA_PrintOutput*)UA_malloc(sizeof(UA_PrintOutput) + length + 1);
     if (!output)
-        return NULL;
+        return 0x0;
     output->length = length;
     TAILQ_INSERT_TAIL(&ctx->outputs, output, next);
     return output;
 }
 
-// helper function of tail queue
-static UA_StatusCode UA_PrintContext_addNewlineTabs(UA_PrintContext* ctx, size_t tabs) {
+// copy of open62541/src/ua_types_print.c
+UA_StatusCode UA_PrintContext_addNewlineTabs(UA_PrintContext* ctx, size_t tabs) {
     UA_PrintOutput* out = UA_PrintContext_addOutput(ctx, tabs + 1);
     if (!out)
         return UA_STATUSCODE_BADOUTOFMEMORY;
@@ -353,116 +1048,303 @@ static UA_StatusCode UA_PrintContext_addNewlineTabs(UA_PrintContext* ctx, size_t
     return UA_STATUSCODE_GOOD;
 }
 
-// helper function of tail queue
-static UA_StatusCode UA_PrintContext_addName(UA_PrintContext* ctx, const char* name) {
-    size_t nameLen = strlen(name);
-    UA_PrintOutput* out = UA_PrintContext_addOutput(ctx, nameLen + 2);
+// copy of open62541/src/ua_types_print.c
+UA_StatusCode UA_PrintContext_addString(UA_PrintContext* ctx, const char* str) {
+    if (!str) {
+        UA_PrintOutput* out = UA_PrintContext_addOutput(ctx, 3);
+        if (!out)
+            return UA_STATUSCODE_BADOUTOFMEMORY;
+        memcpy(&out->data, "???", 3);
+        return UA_STATUSCODE_GOOD;
+    }
+    else {
+        size_t len = strlen(str);
+        UA_PrintOutput* out = UA_PrintContext_addOutput(ctx, len);
+        if (!out)
+            return UA_STATUSCODE_BADOUTOFMEMORY;
+        memcpy(&out->data, str, len);
+        return UA_STATUSCODE_GOOD;
+    }
+}
+
+// copy of open62541/src/ua_types_print.c
+UA_StatusCode UA_PrintContext_addUAString(UA_PrintContext* ctx, UA_String* str) {
+    UA_PrintOutput* out = UA_PrintContext_addOutput(ctx, str->length);
     if (!out)
         return UA_STATUSCODE_BADOUTOFMEMORY;
-    memcpy(&out->data, name, nameLen);
-    out->data[nameLen] = ':';
-    out->data[nameLen + 1] = ' ';
+    memcpy(&out->data, str->data, str->length);
     return UA_STATUSCODE_GOOD;
 }
 
-// helper function of tail queue
-static UA_StatusCode UA_PrintContext_addString(UA_PrintContext* ctx, const char* str) {
-    size_t len = strlen(str);
-    UA_PrintOutput* out = UA_PrintContext_addOutput(ctx, len);
-    if (!out)
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-    memcpy(&out->data, str, len);
-    return UA_STATUSCODE_GOOD;
-}
-
-// helper function of tail queue
-static UA_StatusCode printNodeId(UA_PrintContext* ctx, const UA_NodeId* p, const UA_DataType* _) {
+// prints custom data type map to UA_String
+UA_StatusCode UA_PrintCustomDataTypeMap(UA_String* output) {
+    UA_PrintContext ctx{};
+    UA_StatusCode retval;
     UA_String out;
-    UA_String_init(&out);
-    UA_StatusCode res = UA_NodeId_print(p, &out);
-    if (res != UA_STATUSCODE_GOOD)
-        return res;
-    UA_PrintOutput* po = UA_PrintContext_addOutput(ctx, out.length);
-    if (po)
-        memcpy(po->data, out.data, out.length);
-    else
-        res = UA_STATUSCODE_BADOUTOFMEMORY;
-    UA_String_clear(&out);
-    return res;
-}
-
-// helper function of tail queue
-static UA_StatusCode printString(UA_PrintContext* ctx, const UA_String* p, const UA_DataType* _) {
-    if (!p->data)
-        return UA_PrintContext_addString(ctx, "NullString");
-    UA_PrintOutput* out = UA_PrintContext_addOutput(ctx, p->length + 2);
-    if (!out)
-        return UA_STATUSCODE_BADOUTOFMEMORY;
-    UA_snprintf((char*)out->data, p->length + 3, "\"%.*s\"", (int)p->length, p->data);
-    return UA_STATUSCODE_GOOD;
-}
-
-// helper function of tail queue
-static UA_StatusCode printByteString(UA_PrintContext* ctx, const UA_ByteString* p, const UA_DataType* _) {
-    if (!p->data)
-        return UA_PrintContext_addString(ctx, "NullByteString");
-    UA_String str = UA_BYTESTRING_NULL;
-    UA_StatusCode res = UA_ByteString_toBase64(p, &str);
-    if (res != UA_STATUSCODE_GOOD)
-        return res;
-    res = printString(ctx, &str, NULL);
-    UA_String_clear(&str);
-    return res;
-}
-
-// prints variant data type ENUM to UA_String
-static UA_StatusCode UA_printEnum(const void* pData, UA_DataType* userDataType, UA_String* output) {
-    UA_UInt32 typeIdHash = UA_NodeId_hash(&userDataType->typeId);
-    std::map<UA_UInt32, type_properties_t>::iterator typeProperty = getTypeProperty(typeIdHash);
-    std::vector<std::map<std::string, std::string>>::iterator dataTypeAttributePropertySegment;
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    UA_PrintContext ctx = UA_PrintContext();
+    if (!output) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintCustomDataTypeMap: Parameter 1 (UA_String*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    retval = UA_STATUSCODE_GOOD;
     ctx.depth = 0;
     TAILQ_INIT(&ctx.outputs);
-    UA_Variant* p = (UA_Variant*)pData;
-    UA_UInt32 value = 0;
     UA_String_init(output);
-    if (!p->type)
-        return UA_PrintContext_addString(&ctx, "NullVariant");
-    retval |= UA_PrintContext_addString(&ctx, "{");
-    ctx.depth++;
-
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addName(&ctx, EXO_DATATYPE);
+    retval |= UA_PrintContext_addString(&ctx, "***************************** DATA TYPE MAP BEGIN *****************************");
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    for (std::pair<const UA_UInt32, customTypeProperties_t>& typeProp : dataTypeMap) {
+        retval |= UA_PrintDataType(&typeProp.second.dataType, &out);
+        retval |= UA_PrintContext_addUAString(&ctx, &out);
+        UA_String_clear(&out);
+        retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    }
+    retval |= UA_PrintContext_addString(&ctx, "****************************** DATA TYPE MAP END ******************************");
+    /* Allocate memory for the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t total = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next)
+            total += out->length;
+        retval = UA_ByteString_allocBuffer((UA_String*)output, total);
+    }
+    /* Write the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t pos = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next) {
+            memcpy(&output->data[pos], out->data, out->length);
+            pos += out->length;
+        }
+    }
+    /* Free the context */
+    UA_PrintOutput* o, * o2;
+    TAILQ_FOREACH_SAFE(o, &ctx.outputs, next, o2) {
+        TAILQ_REMOVE(&ctx.outputs, o, next);
+        UA_free(o);
+    }
+    return retval;
+}
+
+// prints data type structure to UA_String
+UA_StatusCode UA_PrintDataType(const UA_DataType* dataType, UA_String* output) {
+    UA_PrintContext ctx{};
+    UA_StatusCode retval;
+    UA_String out;
+    UA_UInt32 size;
+
+    if (!dataType) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintDataType: Parameter 1 (UA_DataType*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (!output) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintDataType: Parameter 2 (UA_String*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    retval = UA_STATUSCODE_GOOD;
+    ctx.depth = 0;
+    TAILQ_INIT(&ctx.outputs);
+    UA_String_init(output);
 #ifdef UA_ENABLE_TYPEDESCRIPTION
-    retval |= UA_PrintContext_addString(&ctx, p->type->typeName);
+    UA_PrintContext_addName(&ctx, dataType->typeName);
 #endif
-    retval |= UA_PrintContext_addString(&ctx, " (ENUM),");
+    retval |= UA_PrintContext_addString(&ctx, "\n{");
+    ctx.depth++;
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "NodeId: ");
+    UA_print(&dataType->typeId, &UA_TYPES[UA_TYPES_NODEID], &out);
+    UA_PrintContext_addUAString(&ctx, &out);
+    UA_String_clear(&out);
 
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addName(&ctx, "Value");
-    if (UA_Variant_isScalar(p)) {
-        retval |= UA_PrintContext_addString(&ctx, "{");
-        ctx.depth++;
-        value = *((UA_UInt32*)p->data);
-        dataTypeAttributePropertySegment = typeProperty->second.dataTypeAttributes.begin();
-        if (dataTypeAttributePropertySegment == typeProperty->second.dataTypeAttributes.end())
-            return UA_STATUSCODE_BAD;
-        if (value < typeProperty->second.propertyMap.size()) {
+    retval |= UA_PrintContext_addString(&ctx, "BinaryNodeId: ");
+    UA_print(&dataType->binaryEncodingId, &UA_TYPES[UA_TYPES_NODEID], &out);
+    UA_PrintContext_addUAString(&ctx, &out);
+    UA_String_clear(&out);
+
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "Type Index: ");
+    UA_print(&dataType->typeIndex, &UA_TYPES[UA_TYPES_UINT16], &out);
+    UA_PrintContext_addUAString(&ctx, &out);
+    UA_String_clear(&out);
+
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "Type Kind: ");
+    UA_PrintTypeKind(dataType->typeKind, &out);
+    UA_PrintContext_addUAString(&ctx, &out);
+    UA_String_clear(&out);
+
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "Memory Size: ");
+    size = dataType->memSize;
+    UA_print(&size, &UA_TYPES[UA_TYPES_UINT16], &out);
+    UA_PrintContext_addUAString(&ctx, &out);
+    UA_String_clear(&out);
+    retval |= UA_PrintContext_addString(&ctx, " bytes");
+
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "Pointer Free: ");
+    retval |= UA_PrintContext_addString(&ctx, dataType->pointerFree ? "TRUE" : "FALSE");
+
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "Overlayable: ");
+    retval |= UA_PrintContext_addString(&ctx, dataType->overlayable ? "TRUE" : "FALSE");
+
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "Number Of Members: ");
+    size = dataType->membersSize;
+    UA_print(&size, &UA_TYPES[UA_TYPES_UINT16], &out);
+    UA_PrintContext_addUAString(&ctx, &out);
+    UA_String_clear(&out);
+
+    if (size) {
+        retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+        retval |= UA_PrintContext_addString(&ctx, "Data Type Members: {");
+    }
+    for (UA_UInt32 i = 0; i < size; i++) {
+        retval |= UA_PrintDataTypeMember(&dataType->members[i], &out);
+        UA_PrintContext_addUAString(&ctx, &out);
+        UA_String_clear(&out);
+    }
+    typePropIt_t typePropIt = dataTypeMap.find(UA_NodeId_hash(&dataType->typeId));
+    if (dataType->typeKind == UA_DATATYPEKIND_STRUCTURE) {
+        if (typePropIt != dataTypeMap.end()) {
+            if (isOptionSet(&typePropIt->second.subTypeOfId)) {
+                retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+                retval |= UA_PrintContext_addString(&ctx, "}");
+                retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+                retval |= UA_PrintContext_addString(&ctx, "OptionSet Values: {");
+                for (UA_UInt32 i = 0; i < typePropIt->second.structureDefinition.size(); i++) {
+                    ctx.depth++;
+                    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+                    for (UA_UInt32 j = 0; j < typePropIt->second.structureDefinition[i].fieldsSize; j++) {
+                        retval |= UA_PrintContext_addString(&ctx, "[0x");
+                        retval |= printUInt32(&ctx, 2 << j, 4, true);
+                        retval |= UA_PrintContext_addString(&ctx, "] ");
+                        UA_PrintContext_addUAString(&ctx, &typePropIt->second.structureDefinition[i].fields[j].name);
+                        if (j + 1 < (UA_UInt32)typePropIt->second.structureDefinition[i].fieldsSize)
+                            retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+                    }
+                    ctx.depth--;
+                }
+            }
+        }
+    }
+    else if (dataType->typeKind == UA_DATATYPEKIND_ENUM) {
+        if (typePropIt != dataTypeMap.end()) {
             retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-            UA_PrintOutput* out = UA_PrintContext_addOutput(&ctx, typeProperty->second.propertyMap[value].length());
-            if (!out)
-                retval |= UA_STATUSCODE_BADOUTOFMEMORY;
-            else
-                memcpy(&out->data, typeProperty->second.propertyMap[value].c_str(), typeProperty->second.propertyMap[value].length());
+            retval |= UA_PrintContext_addString(&ctx, "ENUM values: {");
+            ctx.depth++;
+            retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+            for (UA_UInt32 i = 0; i < typePropIt->second.enumValueSet.size(); i++) {
+                UA_PrintContext_addUAString(&ctx, &typePropIt->second.enumValueSet[i].displayName.text);
+                retval |= UA_PrintContext_addString(&ctx, " (");
+                retval |= printUInt32(&ctx, (UA_UInt32)typePropIt->second.enumValueSet[i].value);
+                retval |= UA_PrintContext_addString(&ctx, ")");
+                if (i + 1 < (UA_UInt32)typePropIt->second.enumValueSet.size())
+                    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+            }
+            ctx.depth--;
+            retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+            retval |= UA_PrintContext_addString(&ctx, "}");
         }
-        else {
-            retval |= UA_PrintContext_addString(&ctx, " (is not a number)");
-        }
+    }
+    if (size) {
+        retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+        retval |= UA_PrintContext_addString(&ctx, "}");
     }
     ctx.depth--;
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
     retval |= UA_PrintContext_addString(&ctx, "}");
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+
+    /* Allocate memory for the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t total = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next)
+            total += out->length;
+        retval = UA_ByteString_allocBuffer((UA_String*)output, total);
+    }
+    /* Write the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t pos = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next) {
+            memcpy(&output->data[pos], out->data, out->length);
+            pos += out->length;
+        }
+    }
+    /* Free the context */
+    UA_PrintOutput* o, * o2;
+    TAILQ_FOREACH_SAFE(o, &ctx.outputs, next, o2) {
+        TAILQ_REMOVE(&ctx.outputs, o, next);
+        UA_free(o);
+    }
+    return retval;
+}
+
+// prints data type member to UA_String 
+UA_StatusCode UA_PrintDataTypeMember(UA_DataTypeMember* dataTypeMember, UA_String* output) {
+    UA_PrintContext ctx{};
+    UA_StatusCode retval;
+    UA_String out;
+    UA_UInt32 val;
+
+    if (!dataTypeMember) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintDataTypeMember: Parameter 1 (UA_DataTypeMember*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (!output) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintDataTypeMember: Parameter 2 (UA_String*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    retval = UA_STATUSCODE_GOOD;
+    ctx.depth = 2; // main use as a sub-function of UA_PrintDataType
+    TAILQ_INIT(&ctx.outputs);
+    UA_String_init(output);
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+    UA_PrintContext_addString(&ctx, dataTypeMember->memberName);
+    retval |= UA_PrintContext_addString(&ctx, ": {");
+    ctx.depth++;
+#endif
+
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "Type Index: ");
+    UA_print(&dataTypeMember->memberTypeIndex, &UA_TYPES[UA_TYPES_UINT16], &out);
+    UA_PrintContext_addUAString(&ctx, &out);
+    UA_String_clear(&out);
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+    UA_PrintContext_addName(&ctx, "Name");
+    if (dataTypeMember->namespaceZero) {
+        UA_PrintContext_addString(&ctx, UA_TYPES[dataTypeMember->memberTypeIndex].typeName);
+    }
+    else {
+        UA_print(&dataTypeMember->memberTypeIndex, &UA_TYPES[UA_TYPES_UINT16], &out);
+        UA_PrintContext_addUAString(&ctx, &out);
+        UA_String_clear(&out);
+    }
+#endif
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "Namespace Is Zero: ");
+    retval |= UA_PrintContext_addString(&ctx, dataTypeMember->namespaceZero ? "TRUE" : "FALSE");
+
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "Is Array: ");
+    retval |= UA_PrintContext_addString(&ctx, dataTypeMember->isArray ? "TRUE" : "FALSE");
+
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "Is Optional: ");
+    retval |= UA_PrintContext_addString(&ctx, dataTypeMember->isOptional ? "TRUE" : "FALSE");
+
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "Padding Bytes: ");
+    val = dataTypeMember->padding;
+    UA_print(&val, &UA_TYPES[UA_TYPES_UINT16], &out);
+    UA_PrintContext_addUAString(&ctx, &out);
+    UA_String_clear(&out);
+
     ctx.depth--;
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
     retval |= UA_PrintContext_addString(&ctx, "}");
@@ -474,7 +1356,6 @@ static UA_StatusCode UA_printEnum(const void* pData, UA_DataType* userDataType, 
             total += out->length;
         retval = UA_ByteString_allocBuffer((UA_String*)output, total);
     }
-
     /* Write the output */
     if (retval == UA_STATUSCODE_GOOD) {
         size_t pos = 0;
@@ -484,7 +1365,153 @@ static UA_StatusCode UA_printEnum(const void* pData, UA_DataType* userDataType, 
             pos += out->length;
         }
     }
+    /* Free the context */
+    UA_PrintOutput* o, * o2;
+    TAILQ_FOREACH_SAFE(o, &ctx.outputs, next, o2) {
+        TAILQ_REMOVE(&ctx.outputs, o, next);
+        UA_free(o);
+    }
+    return retval;
+}
 
+// prints dictionaries of the OPC UA server to UA_String
+UA_StatusCode UA_PrintDictionaries(UA_Client* client, UA_String* output) {
+    std::map<UA_UInt32, std::string> dictionaries;
+    UA_PrintContext ctx{};
+    UA_StatusCode retval;
+    UA_String out;
+    UA_UInt32 nameSpaceIndex = 0;
+
+    if (!client) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintDictionaries: Client session invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (!output) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintDictionaries: Parameter 2 (UA_String*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    retval = getDictionaries(client, &dictionaries);
+    if (retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintDictionaries: Could not retrieve OPC UA dictionary");
+        return retval;
+    }
+    ctx.depth = 0;
+    TAILQ_INIT(&ctx.outputs);
+    UA_String_init(output);
+    for (std::pair<const UA_UInt32, std::string>& currentDictionary : dictionaries) {
+        retval |= UA_PrintContext_addString(&ctx, "namespace ");
+        nameSpaceIndex = currentDictionary.first;
+        UA_print(&nameSpaceIndex, &UA_TYPES[UA_TYPES_UINT32], &out);
+        UA_PrintContext_addUAString(&ctx, &out);
+        UA_String_clear(&out);
+        retval |= UA_PrintContext_addString(&ctx, ":\n{");
+        ctx.depth++;
+        std::string s;
+        std::istringstream f(currentDictionary.second.c_str());
+        while (std::getline(f, s, '\n')) {
+            out = UA_STRING_ALLOC(s.c_str());
+            retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+            UA_PrintContext_addUAString(&ctx, &out);
+            UA_String_clear(&out);
+        }
+        ctx.depth--;
+        retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+        retval |= UA_PrintContext_addString(&ctx, "}");
+        retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    }
+    /* Allocate memory for the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t total = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next)
+            total += out->length;
+        retval = UA_ByteString_allocBuffer((UA_String*)output, total);
+    }
+    /* Write the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t pos = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next) {
+            memcpy(&output->data[pos], out->data, out->length);
+            pos += out->length;
+        }
+    }
+    /* Free the context */
+    UA_PrintOutput* o, * o2;
+    TAILQ_FOREACH_SAFE(o, &ctx.outputs, next, o2) {
+        TAILQ_REMOVE(&ctx.outputs, o, next);
+        UA_free(o);
+    }
+    return retval;
+}
+
+// prints variant data type ENUM to UA_String
+UA_StatusCode UA_PrintEnum(const UA_Variant* pData, customTypeProperties_t* customTypeProperties, UA_String* output) {
+    UA_Int32 value;
+    UA_PrintContext ctx;
+    UA_StatusCode retval;
+
+    if (!pData) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintEnum: Parameter 1 (UA_Variant*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (!customTypeProperties || !customTypeProperties->enumValueSet.size() || pData->type->typeIndex != UA_TYPES_INT32 || pData->type->membersSize) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintEnum: Parameter 2 (customTypeProperties_t*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (!output) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintEnum: Parameter 3 (UA_String*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    retval = UA_STATUSCODE_GOOD;
+    ctx = UA_PrintContext();
+    ctx.depth = 0;
+    TAILQ_INIT(&ctx.outputs);
+    UA_String_init(output);
+    value = *(UA_Int32*)pData->data;
+    retval |= UA_PrintContext_addString(&ctx, "{");
+    ctx.depth++;
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addName(&ctx, "DataType");
+    retval |= UA_PrintContext_addString(&ctx, customTypeProperties->dataType.typeName);
+    retval |= UA_PrintContext_addString(&ctx, ",");
+#endif
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addName(&ctx, "Value");
+    UA_UInt32 i = 0;
+    for (; i < customTypeProperties->enumValueSet.size(); i++) {
+        if (customTypeProperties->enumValueSet.at(i).value == value) {
+            retval |= UA_PrintContext_addUAString(&ctx, &customTypeProperties->enumValueSet.at(i).displayName.text);
+            retval |= UA_PrintContext_addString(&ctx, " (");
+            retval |= printUInt32(&ctx, value);
+            retval |= UA_PrintContext_addString(&ctx, ")");
+            break;
+        }
+    }
+    if (i >= customTypeProperties->enumValueSet.size()) {
+        retval |= printUInt32(&ctx, value);
+    }
+    ctx.depth--;
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "}");
+    /* Allocate memory for the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t total = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next)
+            total += out->length;
+        retval = UA_ByteString_allocBuffer((UA_String*)output, total);
+    }
+    /* Write the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t pos = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next) {
+            memcpy(&output->data[pos], out->data, out->length);
+            pos += out->length;
+        }
+    }
     /* Free the context */
     UA_PrintOutput* o, * o2;
     TAILQ_FOREACH_SAFE(o, &ctx.outputs, next, o2) {
@@ -495,685 +1522,713 @@ static UA_StatusCode UA_printEnum(const void* pData, UA_DataType* userDataType, 
 }
 
 // prints variant data type STRUCTURE to UA_String
-static UA_StatusCode UA_printStructure(const void* pData, UA_DataType* userDataType, UA_String* output) {
+UA_StatusCode UA_PrintStructure(const UA_Variant* data, UA_String* output) {
     const UA_DataType* dataType;
-    std::vector<UA_Variant> values;
-    UA_Boolean* variantContent = 0x0;
-    UA_Byte pos = 0;
-    UA_Byte resultingBits = 0;
-    UA_Byte* pValidBits = 0x0;
-    UA_Byte* pValue = 0x0;
-    UA_DataTypeMember* typeMember;
-    UA_PrintContext ctx = UA_PrintContext();
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    UA_UInt32 nodeIdHash = UA_NodeId_hash(&userDataType->typeId);
-    UA_Variant* p = (UA_Variant*)pData;
-    UA_Variant* validBits = 0x0;
-    UA_Variant* value = 0x0;
-    uintptr_t ptrs = (uintptr_t)p->data;
-    typeProperty = typePropertiesMap.find(nodeIdHash);
-    if (typeProperty == typePropertiesMap.end()) {
-        UA_print(pData, &UA_TYPES[userDataType->typeIndex], output);
-        return UA_STATUSCODE_BAD;
+    UA_PrintContext ctx;
+    UA_PrintOutput* out;
+    UA_StatusCode retval;
+    UA_String outString;
+    uintptr_t ptrs;
+
+    if (!data) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintStructure: Parameter 1 (UA_Variant*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
     }
-    if (ptrs && ((UA_ExtensionObject*)ptrs)->encoding == UA_EXTENSIONOBJECT_ENCODED_BYTESTRING) {
-        for (UA_UInt16 i = 0; i < typeProperty->second.dataType.membersSize; i++) {
-            typeMember = &typeProperty->second.dataType.members[i];
-            dataType = &UA_TYPES[typeMember->memberTypeIndex];
-            ptrs += typeMember->padding;
-            if (!typeMember->isArray) {
-                UA_Variant varVal;
-                UA_Variant_init(&varVal);
-                retval = UA_Variant_setScalarCopy(&varVal, (void*)ptrs, dataType);
-                if (retval == UA_STATUSCODE_GOOD)
-                    values.push_back(varVal);
-                ptrs += dataType->memSize;
-            }
-        }
-        if (values.size() == 2) {
-            value = &values.at(0);
-            validBits = &values.at(1);
-            pValue = ((UA_ByteString*)value->data)->data;
-            /*printf("\n%-25s: ", "value");
-            binary_print(*pValue);
-            printf(" (%d)\n", *pValue);*/
-            pValidBits = ((UA_ByteString*)validBits->data)->data;
-            /*printf("%-25s: ", "valid bits");
-            binary_print(*pValidBits);
-            printf(" (%d)\n", *pValidBits);*/
-            resultingBits = *pValue & *pValidBits;
-            /*printf("%-25s: ", "result");
-            binary_print(resultingBits);
-            printf(" (%d)\n", resultingBits);*/
-            values.clear();
-            for (std::string property : typeProperty->second.propertyMap) {
-                UA_Variant varVal;
-                UA_Variant_init(&varVal);
-                variantContent = UA_Boolean_new();
-                *variantContent = resultingBits & 0x01 << pos++;
-                UA_Variant_setScalar(&varVal, variantContent, &UA_TYPES[UA_TYPES_BOOLEAN]);
-                values.push_back(varVal);
-            }
-        }
+    if (!output) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintStructure: Parameter 2 (UA_String*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
     }
+    retval = UA_STATUSCODE_GOOD;
+    ctx = UA_PrintContext();
     ctx.depth = 0;
+    dataType = data->type;
+    ptrs = (uintptr_t)data->data;
     TAILQ_INIT(&ctx.outputs);
     UA_String_init(output);
-    if (!p->type)
-        return UA_PrintContext_addString(&ctx, "NullVariant");
+    if (!dataType) {
+        *output = UA_STRING_ALLOC("NullVariant");
+        return UA_STATUSCODE_GOOD;
+    }
     retval |= UA_PrintContext_addString(&ctx, "{");
     ctx.depth++;
-
-    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addName(&ctx, EXO_DATATYPE);
 #ifdef UA_ENABLE_TYPEDESCRIPTION
-    retval |= UA_PrintContext_addString(&ctx, p->type->typeName);
-#endif
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addName(&ctx, "DataType");
+    retval |= UA_PrintContext_addString(&ctx, dataType->typeName);
     retval |= UA_PrintContext_addString(&ctx, ",");
-
+#endif
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
     retval |= UA_PrintContext_addName(&ctx, "Value");
-    if (UA_Variant_isScalar(p)) {
-        retval |= UA_PrintContext_addString(&ctx, "{");
-        ctx.depth++;
-        UA_String outString;
-        for (UA_UInt16 i = 0; i < typeProperty->second.propertyMap.size(); i++) {
-            retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-            const UA_DataType* type = &UA_TYPES[values.at(i).type->typeIndex];
-            size_t len = typeProperty->second.propertyMap.at(i).length();
-            UA_PrintOutput* out = UA_PrintContext_addOutput(&ctx, len);
-            if (!out)
-                retval |= UA_STATUSCODE_BADOUTOFMEMORY;
-            else
-                memcpy(&out->data, typeProperty->second.propertyMap.at(i).c_str(), len);
-            retval |= UA_PrintContext_addString(&ctx, ": ");
-            UA_print(values.at(i).data, type, &outString);
-            len = outString.length;
-            out = UA_PrintContext_addOutput(&ctx, len);
-            if (!out)
-                retval |= UA_STATUSCODE_BADOUTOFMEMORY;
-            else
-                memcpy(&out->data, outString.data, outString.length);
-            UA_String_clear(&outString);
-        }
-    }
-    ctx.depth--;
-    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addString(&ctx, "}");
-    ctx.depth--;
-    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addString(&ctx, "}");
-    /* Allocate memory for the output */
-    if (retval == UA_STATUSCODE_GOOD) {
-        size_t total = 0;
-        UA_PrintOutput* out;
-        TAILQ_FOREACH(out, &ctx.outputs, next)
-            total += out->length;
-        retval = UA_ByteString_allocBuffer((UA_String*)output, total);
-    }
-
-    /* Write the output */
-    if (retval == UA_STATUSCODE_GOOD) {
-        size_t pos = 0;
-        UA_PrintOutput* out;
-        TAILQ_FOREACH(out, &ctx.outputs, next) {
-            memcpy(&output->data[pos], out->data, out->length);
-            pos += out->length;
-        }
-    }
-
-    /* Free the context */
-    UA_PrintOutput* o, * o2;
-    TAILQ_FOREACH_SAFE(o, &ctx.outputs, next, o2) {
-        TAILQ_REMOVE(&ctx.outputs, o, next);
-        UA_free(o);
-    }
-    return retval;
-}
-
-// prints variant data type UNION to UA_String
-static UA_StatusCode UA_printUnion(const void* pData, UA_DataType* userDataType, UA_String* output) {
-    UA_UInt32 typeIdHash = UA_NodeId_hash(&userDataType->typeId);
-    std::map<UA_UInt32, type_properties_t>::iterator typeProperty = getTypeProperty(typeIdHash);
-    UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    UA_PrintContext ctx = UA_PrintContext();
-    ctx.depth = 0;
-    TAILQ_INIT(&ctx.outputs);
-    UA_Variant* p = (UA_Variant*)pData;
-    UA_String_init(output);
-    if (!p->type)
-        return UA_PrintContext_addString(&ctx, "NullVariant");
-    retval |= UA_PrintContext_addString(&ctx, "{");
-    ctx.depth++;
-
-    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addName(&ctx, EXO_DATATYPE);
-#ifdef UA_ENABLE_TYPEDESCRIPTION
-    retval |= UA_PrintContext_addString(&ctx, p->type->typeName);
-#endif
-    retval |= UA_PrintContext_addString(&ctx, ",");
-
-    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addName(&ctx, "Value");
-    if (UA_Variant_isScalar(p)) {
-        UA_UInt32 switchIndex = *((UA_UInt32*)p->data);
-        char out[32];
-        UA_snprintf(out, 32, "switch index: %d", switchIndex);
+    if (UA_Variant_isScalar(data)) {
         retval |= UA_PrintContext_addString(&ctx, "{");
         ctx.depth++;
         retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-        retval |= UA_PrintContext_addString(&ctx, out);
-        retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-        if (switchIndex <= p->type->membersSize) {
-            std::vector<std::map<std::string, std::string>>::iterator dataTypeAttributePropertySegment;
-            std::map<std::string, std::string>::iterator dataTypeAttributeProperty;
-            for (dataTypeAttributePropertySegment = typeProperty->second.dataTypeAttributes.begin(); dataTypeAttributePropertySegment != typeProperty->second.dataTypeAttributes.end(); dataTypeAttributePropertySegment++) {
-                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find("SwitchValue");
-                if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end())
-                    continue;
-                UA_UInt32 index = std::stoi(dataTypeAttributeProperty->second);
-                if (switchIndex != index)
-                    continue;
-                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find(EXO_DATANAME);
-                if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end())
-                    continue;
-                size_t len = dataTypeAttributeProperty->second.length();
-                UA_PrintOutput* out = UA_PrintContext_addOutput(&ctx, len);
-                if (!out)
-                    retval |= UA_STATUSCODE_BADOUTOFMEMORY;
-                else
-                    memcpy(&out->data, dataTypeAttributeProperty->second.c_str(), dataTypeAttributeProperty->second.length());
-                retval |= UA_PrintContext_addString(&ctx, ": ");
-                dataTypeAttributeProperty = dataTypeAttributePropertySegment->find("TypeName");
-                if (dataTypeAttributeProperty == dataTypeAttributePropertySegment->end())
-                    continue;
-                const UA_DataType* dataType = parseDataType(dataTypeAttributeProperty->second);
-                UA_String outString;
-                UA_print((UA_Byte*)p->data + sizeof(UA_UInt32) + p->type->members[switchIndex - 1].padding, dataType, &outString);
-                len = outString.length;
-                out = UA_PrintContext_addOutput(&ctx, len);
-                if (!out)
-                    retval |= UA_STATUSCODE_BADOUTOFMEMORY;
-                else
-                    memcpy(&out->data, outString.data, outString.length);
-                UA_String_clear(&outString);
+        // print OptionSet
+        if (dataType->membersSize == 2 && dataType->members[0].memberTypeIndex == UA_TYPES_BYTESTRING && dataType->members[1].memberTypeIndex == UA_TYPES_BYTESTRING) {
+            typePropIt_t typePropIt = dataTypeMap.find(UA_NodeId_hash(&dataType->typeId));
+            if (typePropIt != dataTypeMap.end()) {
+                UA_Byte* pValue;
+                UA_Byte* pValidBits;
+                UA_Byte resultingBits;
+                ptrs += dataType->members[0].padding;
+                pValue = ((UA_ByteString*)ptrs)->data;
+                ptrs += UA_TYPES[UA_TYPES_BYTESTRING].memSize;
+                ptrs += dataType->members[1].padding;
+                pValidBits = ((UA_ByteString*)ptrs)->data;
+                resultingBits = *pValue & *pValidBits;
+                for (UA_UInt32 i = 0; i < typePropIt->second.structureDefinition.size(); i++) {
+                    for (UA_UInt32 j = 0; j < typePropIt->second.structureDefinition[i].fieldsSize; j++) {
+                        retval |= UA_PrintContext_addUAString(&ctx, &typePropIt->second.structureDefinition[i].fields[j].name);
+                        retval |= UA_PrintContext_addString(&ctx, ": ");
+                        retval |= UA_PrintContext_addString(&ctx, resultingBits & 0x01 << j ? "TRUE" : "FALSE");
+                        if (j < typePropIt->second.structureDefinition[i].fieldsSize - 1)
+                            retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+                    }
+                }
             }
-        }
+        } // print structure members
         else {
-            retval |= UA_PrintContext_addString(&ctx, "Union switch index is invalid");
-        }
-        ctx.depth--;
-        retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    }
-    retval |= UA_PrintContext_addString(&ctx, "}");
-    ctx.depth--;
-    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addString(&ctx, "}");
-    /* Allocate memory for the output */
-    if (retval == UA_STATUSCODE_GOOD) {
-        size_t total = 0;
-        UA_PrintOutput* out;
-        TAILQ_FOREACH(out, &ctx.outputs, next)
-            total += out->length;
-        retval = UA_ByteString_allocBuffer((UA_String*)output, total);
-    }
-
-    /* Write the output */
-    if (retval == UA_STATUSCODE_GOOD) {
-        size_t pos = 0;
-        UA_PrintOutput* out;
-        TAILQ_FOREACH(out, &ctx.outputs, next) {
-            memcpy(&output->data[pos], out->data, out->length);
-            pos += out->length;
-        }
-    }
-
-    /* Free the context */
-    UA_PrintOutput* o, * o2;
-    TAILQ_FOREACH_SAFE(o, &ctx.outputs, next, o2) {
-        TAILQ_REMOVE(&ctx.outputs, o, next);
-        UA_free(o);
-    }
-    return retval;
-}
-
-// debug-print of data type property structure
-void printTypeProperty(std::map<UA_UInt32, type_properties_t>::iterator typeProperty) {
-    UA_String out;
-
-    printf("%40.*s: ", (UA_UInt16)typeProperty->second.browseName.name.length, typeProperty->second.browseName.name.data);
-    UA_print(&typeProperty->second.dataType.typeId, &UA_TYPES[UA_TYPES_NODEID], &out);
-    printf("Node ID: %.*s (%u); ", (UA_UInt16)out.length, out.data, typeProperty->first);
-    UA_String_clear(&out);
-    UA_printNodeClass(typeProperty->second.nodeClass, &out);
-    printf("Node Class: %.*s (%d); ", (UA_UInt16)out.length, out.data, (UA_UInt16)typeProperty->second.nodeClass);
-    UA_String_clear(&out);
-    UA_print(&typeProperty->second.dataType.binaryEncodingId, &UA_TYPES[UA_TYPES_NODEID], &out);
-    printf("Binary Encoding ID: %.*s; ", (UA_UInt16)out.length, out.data);
-    UA_String_clear(&out);
-    UA_print(&typeProperty->second.dataTypeId, &UA_TYPES[UA_TYPES_NODEID], &out);
-    printf("Type ID: %.*s; ", (UA_UInt16)out.length, out.data);
-    UA_String_clear(&out);
-    UA_print(&typeProperty->second.typeDefId, &UA_TYPES[UA_TYPES_NODEID], &out);
-    printf("Type Definition ID: %.*s; ", (UA_UInt16)out.length, out.data);
-    UA_String_clear(&out);
-    UA_print(&typeProperty->second.propertyId, &UA_TYPES[UA_TYPES_NODEID], &out);
-    printf("Property Node ID: %.*s; ", (UA_UInt16)out.length, out.data);
-    UA_String_clear(&out);
-    UA_print(&typeProperty->second.subTypeId, &UA_TYPES[UA_TYPES_NODEID], &out);
-    printf("Subtype ID: %.*s; ", (UA_UInt16)out.length, out.data);
-    UA_String_clear(&out);
-    UA_print(&typeProperty->second.descriptionId, &UA_TYPES[UA_TYPES_NODEID], &out);
-    printf("Description ID: %.*s\n", (UA_UInt16)out.length, out.data);
-    UA_String_clear(&out);
-}
-
-// calculates the additional memory consumption (padding) of structure elements in the RAM
-// returns resulting RAM size of whole structure
-// this is a sub function of buildUserDataType
-UA_Byte calc_struct_padding(std::vector<const UA_DataType*>* structMemberTypes, std::vector<UA_Byte>* paddingSegments) {
-    UA_Byte maxVal = 0;
-    UA_Byte size = 0;
-    UA_Byte bytes = 0;
-    UA_Byte padding = 0;
-    UA_Byte currentMemoryBank = 0;
-    for (const UA_DataType* dataType : *structMemberTypes) {
-        if (!dataType)
-            continue;
-        padding = 0;
-        bytes = (UA_Byte)dataType->memSize;
-        if (bytes > maxVal)
-            maxVal = bytes;
-        if (bytes > 1 && currentMemoryBank && bytes + currentMemoryBank > ADDRESS_SIZE) {
-            padding = ADDRESS_SIZE - currentMemoryBank;
-        }
-        else if (bytes > 1 && currentMemoryBank % 2) {
-            padding = 1;
-        }
-        currentMemoryBank += bytes + padding;
-        size += bytes + padding;
-        paddingSegments->push_back(padding);
-        while (currentMemoryBank > ADDRESS_SIZE)
-            currentMemoryBank -= ADDRESS_SIZE;
-        if (currentMemoryBank == ADDRESS_SIZE)
-            currentMemoryBank = 0;
-    }
-    padding = 0;
-    if (maxVal > MEMORY_BANK_SIZE) {
-        while (currentMemoryBank % ADDRESS_SIZE) {
-            padding++;
-            currentMemoryBank++;
-        }
-    }
-    else if (maxVal > 1) {
-        while (currentMemoryBank % maxVal) {
-            padding++;
-            currentMemoryBank++;
-        }
-    }
-    size += padding;
-    return size;
-}
-
-// find the right data type property structure
-std::map<UA_UInt32, type_properties_t>::iterator getTypeProperty(UA_UInt32 nodeIdHash) {
-    std::map<UA_UInt32, type_properties_t>::iterator type_property;
-    type_property = typePropertiesMap.find(nodeIdHash);
-    if (type_property == typePropertiesMap.end()) {
-        type_properties_t properties;
-        memset(&properties, 0x0, sizeof(type_properties_t));
-        UA_QualifiedName_init(&properties.browseName);
-        typePropertiesMap.insert(std::pair<UA_UInt32, type_properties_t>(nodeIdHash, properties));
-        type_property = typePropertiesMap.find(nodeIdHash);
-    }
-    return type_property;
-}
-
-// search data type tree recursively and collect node ids
-void scanForTypeIds(UA_BrowseResponse* bResp, std::map<UA_UInt32, UA_NodeId>* ids) {
-    UA_BrowseResult bRes;
-    UA_ReferenceDescription rDesc;
-    for (size_t i = 0; i < bResp->resultsSize; ++i) {
-        bRes = bResp->results[i];
-        for (size_t j = 0; j < bRes.referencesSize; ++j) {
-            rDesc = bRes.references[j];
-            ids->insert(std::pair<UA_UInt32, UA_NodeId>(UA_NodeId_hash(&rDesc.nodeId.nodeId), rDesc.nodeId.nodeId));
-        }
-    }
-}
-
-// translate node class to string
-void UA_printNodeClass(UA_NodeClass nodeClass, UA_String* out) {
-    switch (nodeClass) {
-    case UA_NODECLASS_UNSPECIFIED: *out = UA_STRING_ALLOC("UNSPECIFIED"); break;
-    case  UA_NODECLASS_OBJECT: *out = UA_STRING_ALLOC("OBJECT"); break;
-    case UA_NODECLASS_VARIABLE: *out = UA_STRING_ALLOC("VARIABLE"); break;
-    case UA_NODECLASS_METHOD: *out = UA_STRING_ALLOC("METHOD"); break;
-    case UA_NODECLASS_OBJECTTYPE: *out = UA_STRING_ALLOC("OBJECTTYPE"); break;
-    case UA_NODECLASS_VARIABLETYPE: *out = UA_STRING_ALLOC("VARIABLETYPE"); break;
-    case UA_NODECLASS_REFERENCETYPE: *out = UA_STRING_ALLOC("REFERENCETYPE"); break;
-    case  UA_NODECLASS_DATATYPE: *out = UA_STRING_ALLOC("DATATYPE"); break;
-    case UA_NODECLASS_VIEW: *out = UA_STRING_ALLOC("VIEW"); break;
-    case __UA_NODECLASS_FORCE32BIT: *out = UA_STRING_ALLOC("FORCE32BIT"); break;
-    default: *out = UA_STRING_ALLOC("UNKNOWN"); break;
-    }
-}
-
-void initializeUserDataTypeIds(UA_Client* client) {
-    std::map<std::string, std::string>::iterator dataTypeAttributeProperty;
-    std::map<UA_UInt32, std::string> dictionaries;
-    std::map<UA_UInt32, type_properties_t>::iterator typeProperty;
-    std::map<UA_UInt32, UA_NodeId> ids;
-    std::map<UA_UInt32, xmlDocPtr> xmlDocMap;
-    std::map<UA_UInt32, xmlDocPtr>::iterator xmlDocNode;
-    std::vector<const UA_DataType*> dataTypeList;
-    std::vector<std::map<std::string, std::string>>::iterator dataTypeAttributePropertySegment;
-    std::vector<UA_Byte> paddings;
-    std::vector<UA_Byte>::iterator padding;
-    std::vector<UA_UInt32> knownIds;
-    std::vector<UA_UInt32>::iterator knownId;
-    UA_BrowseResponse bResp;
-    UA_StatusCode retval = UA_STATUSCODE_BAD;
-    UA_String out;
-    UA_DataType* dataType = 0x0;
-    const UA_DataType* currentType = 0x0;
-    UA_UInt32 typeIdHash = 0;
-    type_properties_t* typeProperties;
-    xmlChar* parentName = NULL;
-    xmlNode* attributeNode = NULL;
-    numberOfUserDataTypes = 0;
-
-    // retrieve all dictionaries of OPC UA server 
-    if (getDictionaries(client, &dictionaries)) {
-        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "retrieve dictionaries was successful");
-    }
-    else {
-        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "retrieve dictionaries failed");
-        return;
-    }
-    // build a document map of dictionary entries
-    getXmlDocMap(&dictionaries, &xmlDocMap);
-    // collect known basic data types
-    ids.insert(std::pair<UA_UInt32, UA_NodeId>(UA_NodeId_hash(&NS0ID_BASEDATATYPE), NS0ID_BASEDATATYPE));
-    while (knownIds.size() != ids.size()) {
-        for (const std::pair<UA_UInt32, UA_NodeId>& id : ids) {
-            if ((knownId = std::find(knownIds.begin(), knownIds.end(), id.first)) != knownIds.end())
-                continue;
-            typeIdHash = UA_NodeId_hash(&id.second);
-            knownIds.push_back(typeIdHash);
-            retval = browseNodeId(client, id.second, &bResp);
-            if (retval != UA_STATUSCODE_GOOD)
-                continue;
-            if (id.second.namespaceIndex > 0 || id.second.identifier.numeric >= UA_TYPES_COUNT) {
-                typeProperty = getTypeProperty(typeIdHash);
-                typeProperties = &typeProperty->second;
-                typeProperties->dataType.typeId = id.second;
-                for (UA_UInt32 i = 0; i < bResp.results[0].referencesSize; i++)
-                    typeProperties->descriptionList.push_back(bResp.results[0].references[i]);
-            }
-            scanForTypeIds(&bResp, &ids);
-        }
-    }
-    // collect properties of data types
-    for (typeProperty = typePropertiesMap.begin(); typeProperty != typePropertiesMap.end();) {
-        typeProperties = &typeProperty->second;
-        dataType = &typeProperties->dataType;
-        retval = UA_Client_readNodeClassAttribute(client, dataType->typeId, &typeProperties->nodeClass);
-        if (typeProperties->nodeClass != UA_NODECLASS_DATATYPE) {
-            typeProperty++;
-            continue;
-        }
-        UA_NodeId_copy(&dataType->typeId, &typeProperties->dataTypeId);
-        retval = UA_Client_readBrowseNameAttribute(client, dataType->typeId, &typeProperties->browseName);
+            for (UA_UInt32 i = 0; i < dataType->membersSize; i++) {
+                typePropIt_t typePropIt = dataTypeMap.end();
+                UA_DataTypeMember* dataTypeMember = &dataType->members[i];
+                std::string ancestorsName = {};
 #ifdef UA_ENABLE_TYPEDESCRIPTION
-        dataType->typeName = (char*)malloc((typeProperties->browseName.name.length + 1) * sizeof(char));
-        if (dataType->typeName) {
-            strncpy((char*)dataType->typeName, (char*)typeProperties->browseName.name.data, typeProperties->browseName.name.length);
-            ((char*)dataType->typeName)[typeProperties->browseName.name.length] = 0x0;
-        }
-#endif 
-        for (auto& description : typeProperties->descriptionList) {
-            if (UA_NodeId_equal(&description.referenceTypeId, &NS0ID_HASTYPEDEFINITION)) {
-                typeProperties->typeDefId = description.nodeId.nodeId;
-            }
-            else if (UA_NodeId_equal(&description.referenceTypeId, &NS0ID_HASSUBTYPE)) {
-                typeProperty->second.subTypeId = description.nodeId.nodeId;
-            }
-            else if (UA_NodeId_equal(&description.referenceTypeId, &NS0ID_HASPROPERTY)) {
-                typeProperties->propertyId = description.nodeId.nodeId;
-                UA_Variant outValue;
-                if (UA_Client_readValueAttribute(client, typeProperties->propertyId, &outValue) == UA_STATUSCODE_GOOD && !UA_Variant_isScalar(&outValue)) {
-                    if (outValue.type->typeId.namespaceIndex == 0 && outValue.type->typeId.identifierType == UA_NODEIDTYPE_NUMERIC && outValue.type->typeId.identifier.numeric == UA_NS0ID_LOCALIZEDTEXT) {
-                        UA_LocalizedText* data = (UA_LocalizedText*)outValue.data;
-                        uintptr_t target = (uintptr_t)outValue.arrayDimensions;
-                        for (UA_UInt32 i = 0; i < (UA_UInt32)outValue.arrayLength; i++) {
-                            typeProperties->propertyMap.push_back(std::string((char*)data[i].text.data, data[i].text.length));
+                if (!is_number(dataTypeMember->memberName)) {
+                    retval |= UA_PrintContext_addName(&ctx, dataTypeMember->memberName);
+                }
+                else {
+                    char* pError;
+                    UA_UInt32 i = (UA_UInt32)strtoll(dataTypeMember->memberName, &pError, 10);
+                    if (dataTypeMember->memberName != pError) {
+                        typePropIt = dataTypeMap.find(i);
+                        if (typePropIt != dataTypeMap.end()) {
+                            ancestorsName = typePropIt->second.dataType.typeName;
+                            retval |= UA_PrintContext_addName(&ctx, typePropIt->second.dataType.typeName);
                         }
                     }
                 }
-            }
-            else if (UA_NodeId_equal(&description.referenceTypeId, &NS0ID_HASENCODING)) {
-                typeProperties->dataType.binaryEncodingId = description.nodeId.nodeId;
-            }
-            else if (UA_NodeId_equal(&description.referenceTypeId, &NS0ID_HASDESCRIPTION)) {
-                typeProperties->descriptionId = description.nodeId.nodeId;
-            }
-            else {
-                UA_print(&description.referenceTypeId, &UA_TYPES[UA_TYPES_NODEID], &out);
-                printf("Node ID: %.*s (%u)\t", (UA_UInt16)out.length, out.data, typeProperty->first);
-                UA_String_clear(&out);
-            }
-        }
-        // add data type properties from dictionary
-        for (xmlDocNode = xmlDocMap.begin(); xmlDocNode != xmlDocMap.end(); ++xmlDocNode) {
-            xmlNode* root_element = xmlDocGetRootElement(xmlDocNode->second);
-            if (findBrowseName(root_element, typeProperties->browseName.name, &attributeNode)) {
-                std::map<std::string, std::string> map;
-                xmlChar* parentName = xmlGetProp(attributeNode, (const xmlChar*)("Name"));
-                if (parentName) {
-                    map.insert(std::pair<std::string, std::string>(std::string(EXO_DATANAME), std::string((char*)parentName)));
-                    typeProperties->dataTypeAttributes.push_back(map);
-                    collectProperties(attributeNode, &typeProperties->dataTypeAttributes, UA_TRUE);
-                    collectProperties(attributeNode->children, &typeProperties->dataTypeAttributes, UA_FALSE);
-                }
-                retval = UA_STATUSCODE_GOOD;
-                break;
-            }
-        }
-        if (typeProperties->dataTypeAttributes.empty()) {
-            typeProperty++;
-            continue;
-        }
-        dataTypeAttributePropertySegment = typeProperties->dataTypeAttributes.begin();
-        dataTypeAttributeProperty = dataTypeAttributePropertySegment->find(EXO_DATATYPE_NS0ID);
-        if (dataTypeAttributeProperty != dataTypeAttributePropertySegment->end()) {
-            if (std::stoul(dataTypeAttributeProperty->second) == UA_NS0ID_ENUMDEFINITION) {
-                typeProperties->dataType.typeKind = UA_DATATYPEKIND_ENUM;
-                typeProperties->dataType.typeIndex = UA_TYPES_EXTENSIONOBJECT;
-            }
-            else if (std::stoul(dataTypeAttributeProperty->second) == UA_NS0ID_STRUCTUREDEFINITION) {
-                typeProperties->dataType.typeKind = UA_DATATYPEKIND_STRUCTURE;
-                typeProperties->dataType.typeIndex = UA_TYPES_EXTENSIONOBJECT;
-            }
-            else {
-                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "unknown data type kind %s", dataTypeAttributeProperty->second.c_str());
-            }
-        }
-        for (auto& dataTypeAttribute : typeProperties->dataTypeAttributes) {
-            dataTypeAttributeProperty = dataTypeAttribute.find("SwitchField");
-            if (dataTypeAttributeProperty != dataTypeAttribute.end())
-                typeProperties->dataType.typeKind = UA_DATATYPEKIND_UNION;
-            dataTypeAttributeProperty = dataTypeAttribute.find("TypeName");
-            if (dataTypeAttributeProperty != dataTypeAttribute.end()) {
-                currentType = parseDataType(dataTypeAttributeProperty->second);
-                if (currentType)
-                    dataTypeList.push_back(currentType);
-                else {
-                    UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "unknown data type %s", dataTypeAttributeProperty->second.c_str());
-                    dataTypeList.clear();
-                    break;
-                }
-            }
-        }
-        if (dataTypeList.size()) {
-            if (typeProperties->dataType.typeKind == UA_DATATYPEKIND_UNION) {
-                const UA_DataType* switchFieldType = 0x0;
-                const UA_DataType* fieldType = 0x0;
-                switchFieldType = dataTypeList.at(0);
-                for (UA_UInt32 i = 1; i < dataTypeList.size(); i++) {
-                    if (!fieldType || fieldType->memSize < dataTypeList[i]->memSize)
-                        fieldType = dataTypeList[i];
-                }
-                dataTypeList.clear();
-                dataTypeList.push_back(switchFieldType);
-                dataTypeList.push_back(fieldType);
-            }
-            typeProperties->dataType.membersSize = dataTypeList.size();
-            paddings.clear();
-            typeProperties->dataType.memSize = calc_struct_padding(&dataTypeList, &paddings);
-            typeProperties->dataType.members = (UA_DataTypeMember*)UA_malloc(typeProperties->dataType.membersSize * sizeof(UA_DataTypeMember));
-            if (typeProperties->dataType.members) {
-                memset(typeProperties->dataType.members, 0x0, typeProperties->dataType.membersSize * sizeof(UA_DataTypeMember));
-                typeProperties->dataType.pointerFree = UA_TRUE;
-                padding = paddings.begin();
-                for (UA_UInt32 i = 0; i < typeProperties->dataType.membersSize && i < dataTypeList.size() && padding != paddings.end(); i++) {
-                    if (!dataTypeList[i]) {
-                        padding++;
-                        continue;
-                    }
-                    typeProperties->dataType.members[i].memberTypeIndex = dataTypeList[i]->typeIndex;
-                    typeProperties->dataType.members[i].isArray = UA_FALSE;
-                    typeProperties->dataType.members[i].isOptional = UA_FALSE;
-                    if (dataTypeList[i]->typeIndex > UA_TYPES_DOUBLE)
-                        typeProperties->dataType.pointerFree;
-                    typeProperties->dataType.members[i].namespaceZero = dataTypeList[i]->typeId.namespaceIndex == 0;
-                    typeProperties->dataType.members[i].padding = *padding;
-#ifdef UA_ENABLE_TYPEDESCRIPTION
-                    size_t length = strlen(dataTypeList[i]->typeName);
-                    typeProperties->dataType.members[i].memberName = (char*)UA_malloc((length + 1) * sizeof(char));
-                    strncpy((char*)typeProperties->dataType.members[i].memberName, dataTypeList[i]->typeName, length);
-                    ((char*)typeProperties->dataType.members[i].memberName)[length] = 0x0;
 #endif
-                    padding++;
+                ptrs += dataTypeMember->padding;
+                if (dataTypeMember->isOptional) {
+                    if (*(UA_Int32**)ptrs) {
+                        if (dataTypeMember->isArray) {
+                            const size_t size = *((const size_t*)ptrs);
+                            ptrs += sizeof(size_t);
+                            retval |= printArray(&ctx, *(void* const*)ptrs, size, &UA_TYPES[dataTypeMember->memberTypeIndex]);
+                            ptrs += sizeof(void*);
+                        }
+                        else
+                        {
+                            retval |= UA_print(*(UA_Int32**)ptrs, &UA_TYPES[dataTypeMember->memberTypeIndex], &outString);
+                            out = UA_PrintContext_addOutput(&ctx, outString.length);
+                            if (!out)
+                                retval |= UA_STATUSCODE_BADOUTOFMEMORY;
+                            else
+                                memcpy(&out->data, outString.data, outString.length);
+                            UA_String_clear(&outString);
+                        }
+                    }
+                    else {
+                        retval |= UA_PrintContext_addString(&ctx, "(disabled)");
+                    }
+                    ptrs += sizeof(void*);
+                    if (i < dataType->membersSize - 1u)
+                        retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+                }
+                else {
+                    if (dataTypeMember->isArray) {
+                        const size_t size = *((const size_t*)ptrs);
+                        ptrs += sizeof(size_t);
+                        retval |= printArray(&ctx, *(void* const*)ptrs, size, &UA_TYPES[dataTypeMember->memberTypeIndex]);
+                        ptrs += sizeof(void*);
+                    }
+                    else
+                    {
+                        retval |= UA_print((const void*)ptrs, &UA_TYPES[dataTypeMember->memberTypeIndex], &outString);
+                        if (ancestorsName.empty() || !is_number(std::string((char*)outString.data, outString.length))) {
+                            out = UA_PrintContext_addOutput(&ctx, outString.length);
+                            if (!out)
+                                retval |= UA_STATUSCODE_BADOUTOFMEMORY;
+                            else
+                                memcpy(&out->data, outString.data, outString.length);
+                        }
+                        else {
+                            char* pError;
+                            std::string ancestorsNameValue = std::string((char*)outString.data, outString.length);
+                            UA_UInt32 i = (UA_UInt32)strtoll(ancestorsNameValue.c_str(), &pError, 10);
+                            if (ancestorsNameValue.c_str() != pError && typePropIt != dataTypeMap.end()) {
+                                for (UA_UInt32 j = 0; j < typePropIt->second.enumValueSet.size(); j++) {
+                                    if (i == typePropIt->second.enumValueSet.at(j).value) {
+                                        retval |= UA_PrintContext_addUAString(&ctx, &typePropIt->second.enumValueSet.at(j).displayName.text);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        UA_String_clear(&outString);
+                        ptrs += UA_TYPES[dataTypeMember->memberTypeIndex].memSize;
+                    }
+                    if (i < dataType->membersSize - 1u)
+                        retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+                }
+            }
+        }
+    }
+    ctx.depth--;
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "}");
+    ctx.depth--;
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "}");
+    /* Allocate memory for the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t total = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next)
+            total += out->length;
+        retval = UA_ByteString_allocBuffer((UA_String*)output, total);
+    }
+    /* Write the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t pos = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next) {
+            memcpy(&output->data[pos], out->data, out->length);
+            pos += out->length;
+        }
+    }
+    /* Free the context */
+    UA_PrintOutput* o, * o2;
+    TAILQ_FOREACH_SAFE(o, &ctx.outputs, next, o2) {
+        TAILQ_REMOVE(&ctx.outputs, o, next);
+        UA_free(o);
+    }
+    return retval;
+}
+
+// prints data type kind name to string
+void UA_PrintTypeKind(UA_UInt32 typeKind, UA_String* output) {
+    if (!output) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintTypeKind: Parameter 2 (UA_String*) invalid");
+        return;
+    }
+    switch (typeKind) {
+    case UA_DATATYPEKIND_BOOLEAN: {
+        *output = UA_STRING_ALLOC("boolean");
+        break;
+    }
+    case UA_DATATYPEKIND_SBYTE: {
+        *output = UA_STRING_ALLOC("signed byte");
+        break;
+    }
+    case UA_DATATYPEKIND_BYTE: {
+        *output = UA_STRING_ALLOC("unsigned byte");
+        break;
+    }
+    case UA_DATATYPEKIND_INT16: {
+        *output = UA_STRING_ALLOC("signed integer (16 bit)");
+        break;
+    }
+    case UA_DATATYPEKIND_UINT16: {
+        *output = UA_STRING_ALLOC("unsigned integer (16 bit)");
+        break;
+    }
+    case UA_DATATYPEKIND_INT32: {
+        *output = UA_STRING_ALLOC("signed integer (32 bit)");
+        break;
+    }
+    case UA_DATATYPEKIND_UINT32: {
+        *output = UA_STRING_ALLOC("unsigned integer (32 bit)");
+        break;
+    }
+    case UA_DATATYPEKIND_INT64: {
+        *output = UA_STRING_ALLOC("signed integer (64 bit)");
+        break;
+    }
+    case UA_DATATYPEKIND_UINT64: {
+        *output = UA_STRING_ALLOC("unsigned integer (64 bit)");
+        break;
+    }
+    case UA_DATATYPEKIND_FLOAT: {
+        *output = UA_STRING_ALLOC("float");
+        break;
+    }
+    case UA_DATATYPEKIND_DOUBLE: {
+        *output = UA_STRING_ALLOC("double");
+        break;
+    }
+    case UA_DATATYPEKIND_STRING: {
+        *output = UA_STRING_ALLOC("string");
+        break;
+    }
+    case UA_DATATYPEKIND_DATETIME: {
+        *output = UA_STRING_ALLOC("date time");
+        break;
+    }
+    case UA_DATATYPEKIND_GUID: {
+        *output = UA_STRING_ALLOC("GUID");
+        break;
+    }
+    case UA_DATATYPEKIND_BYTESTRING: {
+        *output = UA_STRING_ALLOC("byte string");
+        break;
+    }
+    case UA_DATATYPEKIND_XMLELEMENT: {
+        *output = UA_STRING_ALLOC("xml string");
+        break;
+    }
+    case UA_DATATYPEKIND_NODEID: {
+        *output = UA_STRING_ALLOC("node ID");
+        break;
+    }
+    case UA_DATATYPEKIND_EXPANDEDNODEID: {
+        *output = UA_STRING_ALLOC("expanded node ID");
+        break;
+    }
+    case UA_DATATYPEKIND_STATUSCODE: {
+        *output = UA_STRING_ALLOC("status code");
+        break;
+    }
+    case UA_DATATYPEKIND_QUALIFIEDNAME: {
+        *output = UA_STRING_ALLOC("qualified name");
+        break;
+    }
+    case UA_DATATYPEKIND_LOCALIZEDTEXT: {
+        *output = UA_STRING_ALLOC("localized text");
+        break;
+    }
+    case UA_DATATYPEKIND_EXTENSIONOBJECT: {
+        *output = UA_STRING_ALLOC("extension object");
+        break;
+    }
+    case UA_DATATYPEKIND_DATAVALUE: {
+        *output = UA_STRING_ALLOC("data value");
+        break;
+    }
+    case UA_DATATYPEKIND_VARIANT: {
+        *output = UA_STRING_ALLOC("variant");
+        break;
+    }
+    case UA_DATATYPEKIND_DIAGNOSTICINFO: {
+        *output = UA_STRING_ALLOC("diagnostic info");
+        break;
+    }
+    case UA_DATATYPEKIND_DECIMAL: {
+        *output = UA_STRING_ALLOC("decimal");
+        break;
+    }
+    case UA_DATATYPEKIND_ENUM: {
+        *output = UA_STRING_ALLOC("enumeration");
+        break;
+    }
+    case UA_DATATYPEKIND_STRUCTURE: {
+        *output = UA_STRING_ALLOC("structure");
+        break;
+    }
+    case  UA_DATATYPEKIND_OPTSTRUCT/* struct with optional fields */: {
+        *output = UA_STRING_ALLOC("structure with optional fields");
+        break;
+    }
+    case UA_DATATYPEKIND_UNION: {
+        *output = UA_STRING_ALLOC("union");
+        break;
+    }
+    case UA_DATATYPEKIND_BITFIELDCLUSTER /* bitfields + padding */: {
+        *output = UA_STRING_ALLOC("bitfields + padding");
+        break;
+    }
+    default: {
+        *output = UA_STRING_ALLOC("unknown");
+    }
+    }
+}
+
+// prints variant data type UNION to UA_String
+UA_StatusCode UA_PrintUnion(const UA_Variant* data, UA_String* output) {
+    const UA_DataType* dataType;
+    UA_PrintContext ctx;
+    UA_StatusCode retval;
+    UA_String outString;
+    uintptr_t ptrs;
+
+    if (!data) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintUnion: Parameter 1 (UA_Variant*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (!output) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintUnion: Parameter 2 (UA_String*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    retval = UA_STATUSCODE_GOOD;
+    ctx = UA_PrintContext();
+    ctx.depth = 0;
+    dataType = data->type;
+    ptrs = (uintptr_t)data->data;
+    TAILQ_INIT(&ctx.outputs);
+    UA_String_init(output);
+    if (!dataType) {
+        *output = UA_STRING_ALLOC("NullVariant");
+        return UA_STATUSCODE_GOOD;
+    }
+    retval |= UA_PrintContext_addString(&ctx, "{");
+    ctx.depth++;
+
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addName(&ctx, "DataType");
+    retval |= UA_PrintContext_addString(&ctx, dataType->typeName);
+    retval |= UA_PrintContext_addString(&ctx, ",");
+#endif
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    if (UA_Variant_isScalar(data)) {
+        retval |= UA_PrintContext_addName(&ctx, "SwitchValue");
+        UA_UInt32 switchIndex = *((UA_UInt32*)ptrs);
+        retval |= printUInt32(&ctx, switchIndex);
+        //ptrs += UA_TYPES[dataType->members[0].memberTypeIndex].memSize;
+        ptrs += dataType->members[1].padding;
+        if (switchIndex > 0 && switchIndex <= dataType->membersSize) {
+            const UA_DataTypeMember* unionDataTypeMember = &dataType->members[switchIndex - 1];
+            if (unionDataTypeMember) {
+                retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+                retval |= UA_PrintContext_addName(&ctx, "Name");
+                retval |= UA_PrintContext_addString(&ctx, unionDataTypeMember->memberName);
+                retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+#endif
+                retval |= UA_PrintContext_addName(&ctx, "Value");
+                if (unionDataTypeMember->namespaceZero)
+                    retval |= UA_print((void*)ptrs, &UA_TYPES[unionDataTypeMember->memberTypeIndex], &outString);
+                else
+                    retval |= UA_PrintContext_addString(&ctx, "NameSpaceIndex is not 0");
+                if (retval == UA_STATUSCODE_GOOD) {
+                    retval |= UA_PrintContext_addUAString(&ctx, &outString);
+                    UA_String_clear(&outString);
+                }
+                else {
+                    retval = UA_PrintContext_addString(&ctx, UA_StatusCode_name(retval));
                 }
             }
             else {
-                UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "cannot allocate memory for %.*s", (UA_UInt16)typeProperties->browseName.name.length, typeProperties->browseName.name.data);
+                retval |= UA_PrintContext_addString(&ctx, "UNION data type unkown");
             }
         }
         else {
-            typeProperty->second.dataType.memSize = 0;
+            retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+            retval |= UA_PrintContext_addName(&ctx, "Value");
+            retval |= UA_PrintContext_addString(&ctx, "(disabled)");
         }
-        printTypeProperty(typeProperty);
-        dataTypeList.clear();
-        typeProperty++;
     }
-    // count valid user data types
-    typeProperty = typePropertiesMap.begin();
-    while (typeProperty != typePropertiesMap.end()) {
-        if (typeProperty->second.dataType.memSize)
-            numberOfUserDataTypes++;
-        typeProperty++;
+    ctx.depth--;
+    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
+    retval |= UA_PrintContext_addString(&ctx, "}");
+    /* Allocate memory for the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t total = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next)
+            total += out->length;
+        retval = UA_ByteString_allocBuffer((UA_String*)output, total);
     }
-    // build user data types
-    customDataTypes = (UA_DataTypeArray*)UA_malloc(numberOfUserDataTypes * sizeof(UA_DataTypeArray));
-    if (!customDataTypes)
-        return;
-    memset(customDataTypes, 0x0, numberOfUserDataTypes * sizeof(UA_DataTypeArray));
-    typeProperty = typePropertiesMap.begin();
-    UA_UInt32 j = 0;
-    for (size_t i = 0; i < typePropertiesMap.size(); i++) {
-        if (!typeProperty->second.dataType.memSize) {
-            typeProperty++;
+    /* Write the output */
+    if (retval == UA_STATUSCODE_GOOD) {
+        size_t pos = 0;
+        UA_PrintOutput* out;
+        TAILQ_FOREACH(out, &ctx.outputs, next) {
+            memcpy(&output->data[pos], out->data, out->length);
+            pos += out->length;
+        }
+    }
+    /* Free the context */
+    UA_PrintOutput* o, * o2;
+    TAILQ_FOREACH_SAFE(o, &ctx.outputs, next, o2) {
+        TAILQ_REMOVE(&ctx.outputs, o, next);
+        UA_free(o);
+    }
+    return retval;
+}
+
+// prints values of custom and base data types to UA_String
+UA_StatusCode UA_PrintValue(UA_Client* client, UA_NodeId nodeId, UA_Variant* data, UA_String* output) {
+    UA_StatusCode retval;
+    if (!client) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_printValue: Client session invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (UA_NodeId_isNull(&nodeId)) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_printValue: Parameter 2 (UA_NodeId) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (!data) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_printValue: Parameter 3 (UA_Variant*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (!output) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_printValue: Parameter 4 (UA_String*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    retval = UA_STATUSCODE_GOOD;
+    // STRUCTURE / STRUCTURE WITH OPTINAL FIELDS / UNION / OPTION SET
+    if (data->type->typeKind == UA_DATATYPEKIND_STRUCTURE || data->type->typeKind == UA_DATATYPEKIND_OPTSTRUCT)
+        UA_PrintStructure(data, output);
+    // ENUM
+    else if (data->type->typeIndex == UA_TYPES_INT32 && !data->type->membersSize && !data->arrayLength) {
+        UA_NodeId typeId;
+        typePropIt_t typePropIt;
+        retval |= UA_Client_readDataTypeAttribute(client, nodeId, &typeId);
+        if (retval == UA_STATUSCODE_GOOD) {
+            typePropIt = dataTypeMap.find(UA_NodeId_hash(&typeId));
+            if (typePropIt != dataTypeMap.end())
+                UA_PrintEnum(data, &typePropIt->second, output);
+            else
+                UA_print(data, &UA_TYPES[UA_TYPES_VARIANT], output);
+        }
+        else
+            UA_print(data, &UA_TYPES[UA_TYPES_VARIANT], output);
+    }
+    // UNION
+    else if (data->type->typeKind == UA_DATATYPEKIND_UNION)
+        UA_PrintUnion(data, output);
+    // FALLBACK
+    else
+        UA_print(data, &UA_TYPES[UA_TYPES_VARIANT], output);
+    return retval;
+}
+
+// retrieve custom data types from the server node /Types/DataTypes/BaseDataType
+// results are stored in dataTypeMap and dataTypeNameMap
+UA_StatusCode scan4BaseDataTypes(UA_Client* client) {
+    std::vector<UA_NodeId> ids; // nodes to visit
+    std::vector<UA_NodeId> dataTypeIds; // data type nodes
+    std::vector<UA_NodeId> cutomDataTypeIds; // custom data type nodes
+    std::string csBrowseName;
+    UA_BrowseResponse bResp;
+    UA_NodeClass nodeClass;
+    UA_QualifiedName browseName;
+    UA_StatusCode retval;
+    UA_UInt32 typeIdHash;
+    UA_String out;
+
+    if (!client) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "scan4BaseDataTypes: Client session invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    retval = UA_STATUSCODE_BADUNEXPECTEDERROR;
+    // start scanning at server node /Types/DataTypes/BaseDataType
+    ids.push_back(NS0ID_BASEDATATYPE);
+    // collect custom data type node IDs
+    do {
+        for (const UA_NodeId& id : ids) {
+            retval |= browseNodeId(client, id, &bResp);
+            if (retval != UA_STATUSCODE_GOOD)
+                scanForTypeIds(&bResp, &dataTypeIds, &cutomDataTypeIds);
+        }
+        ids.clear();
+        ids.swap(dataTypeIds);
+    } while (!ids.empty());
+    // process custom data type node IDs
+    for (const UA_NodeId& id : cutomDataTypeIds) {
+        typeIdHash = UA_NodeId_hash(&id);
+        retval = UA_Client_readNodeClassAttribute(client, id, &nodeClass);
+        if (retval != UA_STATUSCODE_GOOD) {
+            UA_print(&id, &UA_TYPES[UA_TYPES_NODEID], &out);
+            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "scan4BaseDataTypes: Could not read \"NodeClassAttribute\" for %.*s. (%s)", (UA_UInt16)out.length, out.data, UA_StatusCode_name(retval));
+            UA_String_clear(&out);
             continue;
         }
-        //printTypeProperty(typeProperty);
-        customDataTypes[j].types = &typeProperty->second.dataType;
-        *(size_t*)&(customDataTypes[j]).typesSize = 1;
-        if ((i + 1) < typePropertiesMap.size() && (j + 1) < numberOfUserDataTypes)
-            customDataTypes[j].next = &customDataTypes[j + 1];
-        else
-            customDataTypes[j].next = 0x0;
-        j++;
-        typeProperty++;
+        // retrieve node id references
+        retval |= browseNodeId(client, id, &bResp);
+        if (retval != UA_STATUSCODE_GOOD) {
+            UA_print(&id, &UA_TYPES[UA_TYPES_NODEID], &out);
+            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "scan4BaseDataTypes: Could not browse %.*s. (%s)", (UA_UInt16)out.length, out.data, UA_StatusCode_name(retval));
+            UA_String_clear(&out);
+            continue;
+        }
+        // the link between node tree and dictionary is the BrowseName
+        retval = UA_Client_readBrowseNameAttribute(client, id, &browseName);
+        if (retval != UA_STATUSCODE_GOOD) {
+            UA_print(&id, &UA_TYPES[UA_TYPES_NODEID], &out);
+            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "scan4BaseDataTypes: Could not read \"BrowseNameAttribute\" for %.*s. (%s)", (UA_UInt16)out.length, out.data, UA_StatusCode_name(retval));
+            UA_String_clear(&out);
+            continue;
+        }
+        customTypeProperties_t customTypeProperties;
+        customTypePropertiesInit(&customTypeProperties, &id);
+        csBrowseName = std::string((char*)browseName.name.data, browseName.name.length);
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+        customTypeProperties.dataType.typeName = (char*)UA_malloc(csBrowseName.length() * sizeof(char) + 1);
+        if (customTypeProperties.dataType.typeName)
+            strcpy((char*)customTypeProperties.dataType.typeName, csBrowseName.c_str());
+#endif
+        for (UA_UInt16 i = 0; i < bResp.resultsSize; i++) {
+            // check data type reference first and save type in customTypeProperties
+            for (UA_UInt16 j = 0; j < bResp.results[i].referencesSize; j++) {
+                if (!UA_NodeId_equal(&bResp.results[i].references[j].referenceTypeId, &NS0ID_HASSUBTYPE))
+                    continue;
+                UA_NodeId_copy(&bResp.results[i].references[j].nodeId.nodeId, &customTypeProperties.subTypeOfId);
+                getSubTypeProperties(&customTypeProperties.subTypeOfId, &customTypeProperties);
+            } // end for(UA_UInt16 j = 0; j < bResp.results[i].referencesSize; j++)
+            // check other references
+            for (UA_UInt16 j = 0; j < bResp.results[i].referencesSize; j++) {
+                // check for binary encoding node ID
+                if (UA_NodeId_equal(&bResp.results[i].references[j].referenceTypeId, &NS0ID_HASENCODING))
+                    UA_NodeId_copy(&bResp.results[i].references[j].nodeId.nodeId, &customTypeProperties.dataType.binaryEncodingId);
+                // referenced properties check
+                else if (UA_NodeId_equal(&bResp.results[i].references[j].referenceTypeId, &NS0ID_HASPROPERTY)) {
+                    UA_Variant outValue;
+                    retval = UA_Client_readValueAttribute(client, bResp.results[i].references[j].nodeId.nodeId, &outValue);
+                    // collect structure and enumeration properties of custom data type
+                    if (retval == UA_STATUSCODE_GOOD && !UA_Variant_isScalar(&outValue)) {
+                        if (outValue.type->typeId.identifier.numeric == UA_NS0ID_LOCALIZEDTEXT) {
+                            UA_LocalizedText* data = (UA_LocalizedText*)outValue.data;
+                            UA_StructureDefinition structureDef;
+                            UA_StructureDefinition_init(&structureDef);
+                            structureDef.fieldsSize = outValue.arrayLength;
+                            structureDef.structureType = UA_STRUCTURETYPE_STRUCTURE;
+                            UA_NodeId_copy(&NS0ID_OPTIONSET, &structureDef.baseDataType);
+                            if (customTypeProperties.dataType.typeKind != UA_DATATYPEKIND_ENUM)
+                                structureDef.fields = (UA_StructureField*)malloc(structureDef.fieldsSize * sizeof(UA_StructureField));
+                            for (UA_UInt32 i = 0; i < (UA_UInt32)outValue.arrayLength; i++) {
+                                if (customTypeProperties.dataType.typeKind == UA_DATATYPEKIND_ENUM) {
+                                    UA_EnumValueType enumValue;
+                                    UA_EnumValueType_init(&enumValue);
+                                    enumValue.value = i;
+                                    UA_LocalizedText_copy(&data[i], &enumValue.description);
+                                    UA_LocalizedText_copy(&data[i], &enumValue.displayName);
+                                    customTypeProperties.enumValueSet.push_back(enumValue);
+                                }
+                                else {
+                                    UA_StructureField_init(&structureDef.fields[i]);
+                                    UA_LocalizedText_copy(&data[i], &structureDef.fields[i].description);
+                                    UA_String_copy(&data[i].text, &structureDef.fields[i].name);
+                                    structureDef.fields[i].valueRank = i;
+                                    UA_NodeId_copy(&outValue.type->typeId, &structureDef.fields[i].dataType);
+                                }
+                            }
+                            if (customTypeProperties.dataType.typeKind != UA_DATATYPEKIND_ENUM)
+                                customTypeProperties.structureDefinition.push_back(structureDef);
+                        } // end if(outValue.type->typeId.identifier.numeric == UA_NS0ID_LOCALIZEDTEXT)
+                        else if (outValue.type->typeKind == UA_DATATYPEKIND_EXTENSIONOBJECT) {
+                            if (!UA_Variant_isScalar(&outValue)) {
+                                for (UA_UInt32 i = 0; i < (UA_UInt32)outValue.arrayLength; i++) {
+                                    if (((UA_ExtensionObject*)outValue.data)[i].encoding == UA_EXTENSIONOBJECT_DECODED) {
+                                        const UA_DataType* dataType = ((UA_ExtensionObject*)outValue.data)[i].content.decoded.type;
+                                        UA_ExtensionObject* extObj = &((UA_ExtensionObject*)outValue.data)[i];
+                                        if (extObj->encoding == UA_EXTENSIONOBJECT_DECODED && dataType->typeIndex == UA_TYPES_ENUMVALUETYPE) {
+                                            UA_EnumValueType* enumValue = (UA_EnumValueType*)extObj->content.decoded.data;
+                                            UA_EnumValueType newEnumValue;
+                                            UA_EnumValueType_copy(enumValue, &newEnumValue);
+                                            customTypeProperties.enumValueSet.push_back(newEnumValue);
+                                        }
+                                    }
+                                }
+                            } // if(!UA_Variant_isScalar(&outValue))
+                        } // end else if(outValue.type->typeKind == UA_DATATYPEKIND_EXTENSIONOBJECT)
+                        UA_Variant_clear(&outValue);
+                    } // end if(retval == UA_STATUSCODE_GOOD && !UA_Variant_isScalar(&outValue))
+                } // end else if(UA_NodeId_equal(&bResp.results[i].references[j].referenceTypeId, &NS0ID_HASPROPERTY))
+            } // end for(UA_UInt16 j = 0; j < bResp.results[i].referencesSize; j++)
+        } // end for(UA_UInt16 i = 0; i < bResp.resultsSize; i++)
+        // save custom data type and context properties to global variables dataTypeMap and dataTypeNameMap
+        dataTypeMap.insert(std::pair<UA_UInt32, customTypeProperties_t>(typeIdHash, customTypeProperties));
+        dataTypeNameMap.insert(std::pair<std::string, customTypeProperties_t*>(csBrowseName, &dataTypeMap[typeIdHash]));
     }
-    // configure client session with user data types
-    UA_Client_getConfig(client)->customDataTypes = customDataTypes;
+    return retval;
+}
+
+// search data type tree recursively and collect node IDs
+void scanForTypeIds(UA_BrowseResponse* bResp, std::vector<UA_NodeId>* dataTypeIds, std::vector<UA_NodeId>* cutomDataTypeIds) {
+    UA_BrowseResult bRes;
+    if (!bResp || !dataTypeIds || !cutomDataTypeIds)
+        return;
+    for (size_t i = 0; i < bResp->resultsSize; ++i) {
+        bRes = bResp->results[i];
+        for (size_t j = 0; j < bRes.referencesSize; ++j) {
+            // process only forwarded references and node classes of the "Datatype" type
+            if (!bResp->results[i].references[j].isForward || bResp->results[i].references[j].nodeClass != UA_NODECLASS_DATATYPE)
+                continue;
+            dataTypeIds->push_back(bRes.references[j].nodeId.nodeId);
+            // skip base data types with NameSpaceIndex = 0
+            if (bRes.references[j].nodeId.nodeId.namespaceIndex)
+                cutomDataTypeIds->push_back(bRes.references[j].nodeId.nodeId);
+        }
+    }
 }
 
 int main(int argc, char* argv[]) {
-    const char* uaUrl = "opc.tcp://firing2:48010";//"opc.tcp://127.0.0.1:62541/milo";//"opc.tcp://milo.digitalpetri.com:62541/milo";//
-    const UA_UInt16 numberOfIds = 8;
-    const char id[numberOfIds][255] = { "Demo.Static.Scalar.CarExtras" , "Demo.BoilerDemo.Boiler1.HeaterStatus", "Demo.Static.Scalar.OptionSet", "Demo.Static.Scalar.XmlElement", "Demo.Static.Scalar.Structure", "Demo.Static.Scalar.Union", "Demo.Static.Scalar.Structures.AnalogMeasurement", "Person1" };//"ComplexTypes/CustomStructTypeVariable";//"ComplexTypes/CustomUnionTypeVariable";//"Person1";//"Demo.Static.Scalar.Priority";//"ComplexTypes/CustomEnumTypeVariable";//
+    const UA_UInt16 numberOfIds = 11; //3;// 
+    const char id[numberOfIds][255] = { "Demo.Static.Arrays.String", "Demo.Static.Arrays.Int32", "Demo.Static.Scalar.CarExtras", "Demo.BoilerDemo.Boiler1.HeaterStatus", "Demo.Static.Scalar.OptionSet", "Demo.Static.Scalar.XmlElement", "Demo.Static.Scalar.Structure", "Demo.Static.Scalar.Union", "Demo.Static.Scalar.Structures.AnalogMeasurement", "Person1", "Demo.Static.Scalar.OptionalFields" };//{ "ComplexTypes/CustomStructTypeVariable", "ComplexTypes/CustomEnumTypeVariable", "ComplexTypes/CustomUnionTypeVariable" };//
+    const char* uaUrl = "opc.tcp://firing2.exp.bessy.de:48010";//"opc.tcp://milo.digitalpetri.com:62541/milo";//
+    UA_Client* client;
     UA_NodeId nodeId;
-    UA_Client* client = 0x0;
-    UA_StatusCode retval = UA_STATUSCODE_BAD;
+    UA_StatusCode retval;
     UA_String out;
     UA_Variant outValue;
 
     if (argc > 1) uaUrl = argv[1];
 
-    // pre-initialisation of the user data type
-    // connect to server
+    // open OPC UA session
     client = UA_Client_new();
     UA_ClientConfig_setDefault(UA_Client_getConfig(client));
     retval = UA_Client_connect(client, uaUrl);
     if (retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Could not open OPC UA client session. (%s)", UA_StatusCode_name(retval));
         UA_Client_delete(client);
         return EXIT_FAILURE;
     }
-    initializeUserDataTypeIds(client);
-    for (UA_UInt16 i = 0; i < numberOfIds; i++) {
-        nodeId = UA_NODEID_STRING_ALLOC(2, id[i]);
-        // print node ID
-        UA_print(&nodeId, &UA_TYPES[UA_TYPES_NODEID], &out);
-        printf("%.*s: ", (UA_UInt16)out.length, out.data);
+
+
+    // print dictionaries of the OPC UA server
+    retval = UA_PrintDictionaries(client, &out);
+    if (retval == UA_STATUSCODE_GOOD)
+        printf("%.*s\n", (UA_UInt16)out.length, out.data);
+    UA_String_clear(&out);
+
+
+    // initialization of the custom data type
+    retval = initializeCustomDataTypes(client);
+    if (retval != UA_STATUSCODE_GOOD)
+        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Could not initialize custom data types. (%s)", UA_StatusCode_name(retval));
+
+
+    // print custom data type map
+    retval = UA_PrintCustomDataTypeMap(&out);
+    if (retval == UA_STATUSCODE_GOOD) {
+        printf("%.*s\n", (UA_UInt16)out.length, out.data);
         UA_String_clear(&out);
-        // read value
-        UA_Variant_init(&outValue);
+    }
+
+    for (UA_UInt16 i = 0; i < numberOfIds; i++) {
+        // create and print node ID
+        nodeId = UA_NODEID_STRING_ALLOC(2, id[i]);
+        UA_print(&nodeId, &UA_TYPES[UA_TYPES_NODEID], &out);
+        printf("%.*s\n", (UA_UInt16)out.length, out.data);
+        UA_String_clear(&out);
+
+        // read value of OPC UA variable
         retval = UA_Client_readValueAttribute(client, nodeId, &outValue);
-        if (retval == UA_STATUSCODE_GOOD) {
-            // get printable value
-            typeProperty = typePropertiesMap.find(UA_NodeId_hash(&outValue.type->typeId));
-            if (typeProperty == typePropertiesMap.end()) {
-                UA_print(&outValue, &UA_TYPES[UA_TYPES_VARIANT], &out);
-                printf("%.*s\n", (UA_UInt16)out.length, out.data);
-                UA_String_clear(&out);
-                UA_Variant_clear(&outValue);
-                UA_NodeId_clear(&nodeId);
-                continue;
-            }
-            switch (typeProperty->second.dataType.typeKind) {
-            case (UA_DATATYPEKIND_UNION): {
-                UA_printUnion(&outValue, &typeProperty->second.dataType, &out);
-                break;
-            }
-            case (UA_DATATYPEKIND_STRUCTURE): {
-                UA_printStructure(&outValue, &typeProperty->second.dataType, &out);
-                break;
-            }
-            case (UA_DATATYPEKIND_ENUM): {
-                UA_printEnum(&outValue, &typeProperty->second.dataType, &out);
-                break;
-            }
-            default: {
-                UA_print(&outValue, &UA_TYPES[UA_TYPES_VARIANT], &out);
-            }
-            }
-            // print value
-            printf("%.*s\n", (UA_UInt16)out.length, out.data);
+        if (retval != UA_STATUSCODE_GOOD) {
+            UA_print(&nodeId, &UA_TYPES[UA_TYPES_NODEID], &out);
+            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Could not read %.*s (%s)", (UA_UInt16)out.length, out.data, UA_StatusCode_name(retval));
+            UA_String_clear(&out);
+            UA_NodeId_clear(&nodeId);
+            continue;
+        }
+        // print value of OPC UA variable
+        retval = UA_PrintValue(client, nodeId, &outValue, &out);
+        if (retval != UA_STATUSCODE_GOOD) {
+            UA_print(&nodeId, &UA_TYPES[UA_TYPES_NODEID], &out);
+            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Could not print data of %.*s (%s)", (UA_UInt16)out.length, out.data, UA_StatusCode_name(retval));
             UA_String_clear(&out);
             UA_Variant_clear(&outValue);
+            UA_NodeId_clear(&nodeId);
+            continue;
         }
-        else {
-            UA_print(&nodeId, &UA_TYPES[UA_TYPES_NODEID], &out);
-            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "could not read %.*s", (UA_UInt16)out.length, out.data);
-            UA_String_clear(&out);
-        }
+        printf("%.*s\n", (UA_UInt16)out.length, out.data);
+        UA_String_clear(&out);
+        UA_Variant_clear(&outValue);
         UA_NodeId_clear(&nodeId);
     }
-    if (customDataTypes)
-        UA_free(customDataTypes);
+    // close OPC UA session
     UA_Client_disconnect(client);
     UA_Client_delete(client);
     return EXIT_SUCCESS;
