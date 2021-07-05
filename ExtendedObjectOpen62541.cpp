@@ -2012,14 +2012,14 @@ UA_StatusCode scan4BaseDataTypes(UA_Client* client) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "scan4BaseDataTypes: Client session invalid");
         return UA_STATUSCODE_BADUNEXPECTEDERROR;
     }
-    retval = UA_STATUSCODE_BADUNEXPECTEDERROR;
+    retval = UA_STATUSCODE_GOOD;
     // start scanning at server node /Types/DataTypes/BaseDataType
     ids.push_back(NS0ID_BASEDATATYPE);
     // collect custom data type node IDs
     do {
         for (const UA_NodeId& id : ids) {
             retval |= browseNodeId(client, id, &bResp);
-            if (retval != UA_STATUSCODE_GOOD)
+            if (retval == UA_STATUSCODE_GOOD)
                 scanForTypeIds(&bResp, &dataTypeIds, &cutomDataTypeIds);
         }
         ids.clear();
