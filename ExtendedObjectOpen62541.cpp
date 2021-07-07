@@ -143,7 +143,7 @@ UA_UInt32 calc_struct_padding(UA_DataType* dataType) {
             sub_calc_struct_padding(bytes, dataTypeMember, &size, &maxVal, &currentMemoryBank, &padding);
         }
         else
-            bytes = (UA_Byte)UA_TYPES[dataTypeMember->memberTypeIndex].memSize;
+            bytes = dataTypeMember->memberType->memSize;
         sub_calc_struct_padding(bytes, dataTypeMember, &size, &maxVal, &currentMemoryBank, &padding);
     }
     padding = 0;
@@ -319,16 +319,14 @@ void getSubTypeProperties(UA_NodeId* subTypeNodeId, customTypeProperties_t* cust
         customTypeProperties->dataType.members = (UA_DataTypeMember*)UA_malloc(customTypeProperties->dataType.membersSize * sizeof(UA_DataTypeMember));
         if (customTypeProperties->dataType.members) {
             memset(&customTypeProperties->dataType.members[0], 0x0, sizeof(UA_DataTypeMember));
-            customTypeProperties->dataType.members[0].memberTypeIndex = UA_TYPES_BYTESTRING;
-            customTypeProperties->dataType.members[0].namespaceZero = true;
+            customTypeProperties->dataType.members[0].memberType = &UA_TYPES[UA_TYPES_BYTESTRING];
 #ifdef UA_ENABLE_TYPEDESCRIPTION
             customTypeProperties->dataType.members[0].memberName = (char*)UA_malloc(6 * sizeof(char));
             if (customTypeProperties->dataType.members[0].memberName)
                 strcpy((char*)customTypeProperties->dataType.members[0].memberName, "Value");
 #endif
             memset(&customTypeProperties->dataType.members[1], 0x0, sizeof(UA_DataTypeMember));
-            customTypeProperties->dataType.members[1].memberTypeIndex = UA_TYPES_BYTESTRING;
-            customTypeProperties->dataType.members[1].namespaceZero = true;
+            customTypeProperties->dataType.members[1].memberType = &UA_TYPES[UA_TYPES_BYTESTRING];
 #ifdef UA_ENABLE_TYPEDESCRIPTION
             customTypeProperties->dataType.members[1].memberName = (char*)UA_malloc(10 * sizeof(char));
             if (customTypeProperties->dataType.members[1].memberName)
@@ -342,18 +340,15 @@ void getSubTypeProperties(UA_NodeId* subTypeNodeId, customTypeProperties_t* cust
         customTypeProperties->dataType.memSize = calc_struct_padding(&customTypeProperties->dataType);
         customTypeProperties->dataType.overlayable = UA_BINARY_OVERLAYABLE_INTEGER;
         customTypeProperties->dataType.pointerFree = true;
-        customTypeProperties->dataType.typeIndex = UA_TYPES_BYTESTRING;
         customTypeProperties->dataType.typeKind = UA_DATATYPEKIND_STRUCTURE;
     }
     // sub-type is an UNION
     else if (UA_NodeId_equal(subTypeNodeId, &NS0ID_UNION)) {
         customTypeProperties->dataType.typeKind = UA_DATATYPEKIND_UNION;
-        customTypeProperties->dataType.typeIndex = UA_TYPES_SBYTE;
     }
     // sub-type is an ENUMERATION
     else if (UA_NodeId_equal(subTypeNodeId, &NS0ID_ENUMERATION)) {
         customTypeProperties->dataType.typeKind = UA_DATATYPEKIND_ENUM;
-        customTypeProperties->dataType.typeIndex = UA_TYPES_INT32;
         customTypeProperties->dataType.memSize = sizeof(UA_Int32);
         customTypeProperties->dataType.pointerFree = true;
         customTypeProperties->dataType.overlayable = true;
@@ -452,13 +447,6 @@ UA_StatusCode initializeCustomDataTypes(UA_Client* client) {
 // checks whether the SubTypeID is equal to the OptionSetID
 static UA_Boolean isOptionSet(const UA_NodeId* subTypeNodeId) {
     return UA_NodeId_equal(subTypeNodeId, &NS0ID_OPTIONSET);
-}
-
-// source: https://stackoverflow.com/questions/4654636/how-to-determine-if-a-string-is-a-number-with-c
-bool is_number(const std::string& s) {
-    std::string::const_iterator it = s.begin();
-    while (it != s.end() && std::isdigit(*it)) ++it;
-    return !s.empty() && it == s.end();
 }
 
 // converts dictionary data type tag to OPC data type address (generated open62541 data types)
@@ -658,25 +646,12 @@ UA_StatusCode parseXml(std::map<UA_UInt32, std::string>* dictionaries) {
                                 children = children->next;
                                 continue;
                             }
-                            if (memberDataType->typeIndex > UA_TYPES_DOUBLE)
+                            if (!memberDataType->pointerFree || memberDataType->typeId.namespaceIndex == 0 && memberDataType->typeId.identifierType == UA_NODEIDTYPE_NUMERIC && memberDataType->typeId.identifier.numeric > UA_TYPES_DOUBLE)
                                 dataType->pointerFree = false;
                             UA_DataTypeMember dataTypeMember;
                             memset(&dataTypeMember, 0x0, sizeof(UA_DataTypeMember));
-                            dataTypeMember.memberTypeIndex = memberDataType->typeIndex;
-                            if (memberDataType->typeId.namespaceIndex && memberDataType->typeKind == UA_DATATYPEKIND_ENUM) {
-                                dataTypeMember.namespaceZero = 1;
-#ifdef UA_ENABLE_TYPEDESCRIPTION
-                                name = std::to_string(UA_NodeId_hash(&memberDataType->typeId));
-                                tmp = (char**)&dataTypeMember.memberName;
-                                *tmp = (char*)UA_malloc(name.length() * sizeof(char) + 1);
-                                if (*tmp)
-                                    strcpy(*tmp, name.c_str());
-#endif
-                            }
-                            else {
-                                dataTypeMember.namespaceZero = memberDataType->typeId.namespaceIndex == 0;
-                            }
-#ifdef UA_ENABLE_TYPEDESCRIPTION
+                            dataTypeMember.memberType = memberDataType;
+ #ifdef UA_ENABLE_TYPEDESCRIPTION
                             if (!dataTypeMember.memberName) {
                                 tmp = (char**)&dataTypeMember.memberName;
                                 *tmp = (char*)UA_malloc(name.length() * sizeof(char) + 1);
@@ -733,12 +708,11 @@ UA_StatusCode parseXml(std::map<UA_UInt32, std::string>* dictionaries) {
                                 children = children->next;
                                 continue;
                             }
-                            if (memberDataType->typeIndex > UA_TYPES_DOUBLE)
+                            if (!memberDataType->pointerFree || memberDataType->typeId.namespaceIndex == 0 && memberDataType->typeId.identifierType == UA_NODEIDTYPE_NUMERIC && memberDataType->typeId.identifier.numeric > UA_TYPES_DOUBLE)
                                 dataType->pointerFree = false;
                             UA_DataTypeMember dataTypeMember;
                             memset(&dataTypeMember, 0x0, sizeof(UA_DataTypeMember));
-                            dataTypeMember.memberTypeIndex = memberDataType->typeIndex;
-                            dataTypeMember.namespaceZero = memberDataType->typeId.namespaceIndex == 0 || memberDataType->typeKind == UA_DATATYPEKIND_ENUM;
+                            dataTypeMember.memberType = memberDataType;
 #ifdef UA_ENABLE_TYPEDESCRIPTION
                             tmp = (char**)&dataTypeMember.memberName;
                             *tmp = (char*)UA_malloc(name.length() * sizeof(char) + 1);
@@ -792,12 +766,11 @@ UA_StatusCode parseXml(std::map<UA_UInt32, std::string>* dictionaries) {
                                 children = children->next;
                                 continue;
                             }
-                            if (memberDataType->typeIndex > UA_TYPES_DOUBLE)
+                            if (!memberDataType->pointerFree || memberDataType->typeId.namespaceIndex == 0 && memberDataType->typeId.identifierType == UA_NODEIDTYPE_NUMERIC && memberDataType->typeId.identifier.numeric > UA_TYPES_DOUBLE)
                                 dataType->pointerFree = false;
                             UA_DataTypeMember dataTypeMember;
                             memset(&dataTypeMember, 0x0, sizeof(UA_DataTypeMember));
-                            dataTypeMember.memberTypeIndex = memberDataType->typeIndex;
-                            dataTypeMember.namespaceZero = memberDataType->typeId.namespaceIndex == 0 || memberDataType->typeKind == UA_DATATYPEKIND_ENUM;
+                            dataTypeMember.memberType = memberDataType;
 #ifdef UA_ENABLE_TYPEDESCRIPTION
                             tmp = (char**)&dataTypeMember.memberName;
                             *tmp = (char*)UA_malloc(name.length() * sizeof(char) + 1);
@@ -884,8 +857,7 @@ UA_StatusCode parseXml(std::map<UA_UInt32, std::string>* dictionaries) {
                                 return UA_STATUSCODE_BADOUTOFMEMORY;
                             }
                             memset(memoryCheckUnion.members, 0x0, memoryCheckUnion.membersSize * sizeof(UA_DataTypeMember));
-                            memoryCheckUnion.members[0].memberTypeIndex = structMemberTypes.at(0).memberTypeIndex;
-                            memoryCheckUnion.members[0].namespaceZero = structMemberTypes.at(0).namespaceZero;
+                            memoryCheckUnion.members[0].memberType = structMemberTypes.at(0).memberType;
                             dataType->membersSize = structMemberTypes.size() - 1;
                             UA_DataTypeMember* tmp = (UA_DataTypeMember*)UA_realloc(dataType->members, dataType->membersSize * sizeof(UA_DataTypeMember));
                             if (!tmp) {
@@ -904,19 +876,16 @@ UA_StatusCode parseXml(std::map<UA_UInt32, std::string>* dictionaries) {
                                     strcpy((char*)dataType->members[i - 1].memberName, structMemberTypes.at(i).memberName);
                                 }
 #endif
-                                dataType->members[i - 1].memberTypeIndex = structMemberTypes.at(i).memberTypeIndex;
-                                dataType->members[i - 1].namespaceZero = structMemberTypes.at(i).namespaceZero;
+                                dataType->members[i - 1].memberType = structMemberTypes.at(i).memberType;
                                 dataType->members[i - 1].padding = 0;
-                                if (UA_TYPES[dataType->members[i - 1].memberTypeIndex].memSize > maxSize) {
-                                    maxSize = UA_TYPES[dataType->members[i - 1].memberTypeIndex].memSize;
-                                    memoryCheckUnion.members[1].memberTypeIndex = dataType->members[i - 1].memberTypeIndex;
-                                    memoryCheckUnion.members[1].namespaceZero = dataType->members[i - 1].namespaceZero;
+                                if (dataType->members[i - 1].memberType->memSize > maxSize) {
+                                    maxSize = dataType->members[i - 1].memberType->memSize;
+                                    memoryCheckUnion.members[1].memberType = dataType->members[i - 1].memberType;
                                 }
                             }
                             dataType->memSize = calc_struct_padding(&memoryCheckUnion);
                             for (UA_UInt32 i = 1; i < structMemberTypes.size(); i++)
-                                dataType->members[i - 1].padding = UA_TYPES[memoryCheckUnion.members[0].memberTypeIndex].memSize + memoryCheckUnion.members[1].padding;
-                            dataType->typeIndex = UA_TYPES_SBYTE;
+                                dataType->members[i - 1].padding = memoryCheckUnion.members[0].memberType->memSize + memoryCheckUnion.members[1].padding;
                         }
                         // STRUCTURE and STRUCTURE WITH OPTIONAL FIELDS
                         else if (dataType->typeKind == UA_DATATYPEKIND_STRUCTURE || dataType->typeKind == UA_DATATYPEKIND_OPTSTRUCT) {
@@ -924,8 +893,7 @@ UA_StatusCode parseXml(std::map<UA_UInt32, std::string>* dictionaries) {
                                 member = &structMemberTypes.at(i);
                                 dataType->members[i].isOptional = member->isOptional;
                                 dataType->members[i].isArray = member->isArray;
-                                dataType->members[i].memberTypeIndex = member->memberTypeIndex;
-                                dataType->members[i].namespaceZero = member->namespaceZero;
+                                dataType->members[i].memberType = member->memberType;
 #ifdef UA_ENABLE_TYPEDESCRIPTION
                                 if (member->memberName) {
                                     dataType->members[i].memberName = (char*)UA_malloc(strlen(member->memberName) * sizeof(char*) + 1);
@@ -935,7 +903,6 @@ UA_StatusCode parseXml(std::map<UA_UInt32, std::string>* dictionaries) {
 #endif
                             }
                             dataType->memSize = calc_struct_padding(dataType);
-                            dataType->typeIndex = UA_TYPES_EXTENSIONOBJECT;
                         }
                     }
                     else {
@@ -1162,12 +1129,6 @@ UA_StatusCode UA_PrintDataType(const UA_DataType* dataType, UA_String* output) {
     UA_String_clear(&out);
 
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addString(&ctx, "Type Index: ");
-    UA_print(&dataType->typeIndex, &UA_TYPES[UA_TYPES_UINT16], &out);
-    UA_PrintContext_addUAString(&ctx, &out);
-    UA_String_clear(&out);
-
-    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
     retval |= UA_PrintContext_addString(&ctx, "Type Kind: ");
     UA_PrintTypeKind(dataType->typeKind, &out);
     UA_PrintContext_addUAString(&ctx, &out);
@@ -1308,27 +1269,11 @@ UA_StatusCode UA_PrintDataTypeMember(UA_DataTypeMember* dataTypeMember, UA_Strin
     retval |= UA_PrintContext_addString(&ctx, ": {");
     ctx.depth++;
 #endif
-
-    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addString(&ctx, "Type Index: ");
-    UA_print(&dataTypeMember->memberTypeIndex, &UA_TYPES[UA_TYPES_UINT16], &out);
-    UA_PrintContext_addUAString(&ctx, &out);
-    UA_String_clear(&out);
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
 #ifdef UA_ENABLE_TYPEDESCRIPTION
     UA_PrintContext_addName(&ctx, "Name");
-    if (dataTypeMember->namespaceZero) {
-        UA_PrintContext_addString(&ctx, UA_TYPES[dataTypeMember->memberTypeIndex].typeName);
-    }
-    else {
-        UA_print(&dataTypeMember->memberTypeIndex, &UA_TYPES[UA_TYPES_UINT16], &out);
-        UA_PrintContext_addUAString(&ctx, &out);
-        UA_String_clear(&out);
-    }
+    UA_PrintContext_addString(&ctx, dataTypeMember->memberType->typeName);
 #endif
-    retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
-    retval |= UA_PrintContext_addString(&ctx, "Namespace Is Zero: ");
-    retval |= UA_PrintContext_addString(&ctx, dataTypeMember->namespaceZero ? "TRUE" : "FALSE");
 
     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
     retval |= UA_PrintContext_addString(&ctx, "Is Array: ");
@@ -1455,7 +1400,7 @@ UA_StatusCode UA_PrintEnum(const UA_Variant* pData, customTypeProperties_t* cust
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintEnum: Parameter 1 (UA_Variant*) invalid");
         return UA_STATUSCODE_BADUNEXPECTEDERROR;
     }
-    if (!customTypeProperties || !customTypeProperties->enumValueSet.size() || pData->type->typeIndex != UA_TYPES_INT32 || pData->type->membersSize) {
+    if (!customTypeProperties || !customTypeProperties->enumValueSet.size() || pData->type->membersSize) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "UA_PrintEnum: Parameter 2 (customTypeProperties_t*) invalid");
         return UA_STATUSCODE_BADUNEXPECTEDERROR;
     }
@@ -1564,7 +1509,9 @@ UA_StatusCode UA_PrintStructure(const UA_Variant* data, UA_String* output) {
         ctx.depth++;
         retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
         // print OptionSet
-        if (dataType->membersSize == 2 && dataType->members[0].memberTypeIndex == UA_TYPES_BYTESTRING && dataType->members[1].memberTypeIndex == UA_TYPES_BYTESTRING) {
+        if (dataType->membersSize == 2 && 
+            UA_NodeId_equal(&dataType->members[0].memberType->typeId, &NS0ID_BYTESTRING) && 
+            UA_NodeId_equal(&dataType->members[1].memberType->typeId, &NS0ID_BYTESTRING)) {
             typePropIt_t typePropIt = dataTypeMap.find(UA_NodeId_hash(&dataType->typeId));
             if (typePropIt != dataTypeMap.end()) {
                 UA_Byte* pValue;
@@ -1591,22 +1538,8 @@ UA_StatusCode UA_PrintStructure(const UA_Variant* data, UA_String* output) {
             for (UA_UInt32 i = 0; i < dataType->membersSize; i++) {
                 typePropIt_t typePropIt = dataTypeMap.end();
                 UA_DataTypeMember* dataTypeMember = &dataType->members[i];
-                std::string ancestorsName = {};
 #ifdef UA_ENABLE_TYPEDESCRIPTION
-                if (!is_number(dataTypeMember->memberName)) {
-                    retval |= UA_PrintContext_addName(&ctx, dataTypeMember->memberName);
-                }
-                else {
-                    char* pError;
-                    UA_UInt32 i = (UA_UInt32)strtoll(dataTypeMember->memberName, &pError, 10);
-                    if (dataTypeMember->memberName != pError) {
-                        typePropIt = dataTypeMap.find(i);
-                        if (typePropIt != dataTypeMap.end()) {
-                            ancestorsName = typePropIt->second.dataType.typeName;
-                            retval |= UA_PrintContext_addName(&ctx, typePropIt->second.dataType.typeName);
-                        }
-                    }
-                }
+                retval |= UA_PrintContext_addName(&ctx, dataTypeMember->memberName);                
 #endif
                 ptrs += dataTypeMember->padding;
                 if (dataTypeMember->isOptional) {
@@ -1614,12 +1547,11 @@ UA_StatusCode UA_PrintStructure(const UA_Variant* data, UA_String* output) {
                         if (dataTypeMember->isArray) {
                             const size_t size = *((const size_t*)ptrs);
                             ptrs += sizeof(size_t);
-                            retval |= printArray(&ctx, *(void* const*)ptrs, size, &UA_TYPES[dataTypeMember->memberTypeIndex]);
+                            retval |= printArray(&ctx, *(void* const*)ptrs, size, dataTypeMember->memberType);
                             ptrs += sizeof(void*);
                         }
-                        else
-                        {
-                            retval |= UA_print(*(UA_Int32**)ptrs, &UA_TYPES[dataTypeMember->memberTypeIndex], &outString);
+                        else {
+                            retval |= UA_print(*(UA_Int32**)ptrs, dataTypeMember->memberType, &outString);
                             out = UA_PrintContext_addOutput(&ctx, outString.length);
                             if (!out)
                                 retval |= UA_STATUSCODE_BADOUTOFMEMORY;
@@ -1639,13 +1571,12 @@ UA_StatusCode UA_PrintStructure(const UA_Variant* data, UA_String* output) {
                     if (dataTypeMember->isArray) {
                         const size_t size = *((const size_t*)ptrs);
                         ptrs += sizeof(size_t);
-                        retval |= printArray(&ctx, *(void* const*)ptrs, size, &UA_TYPES[dataTypeMember->memberTypeIndex]);
+                        retval |= printArray(&ctx, *(void* const*)ptrs, size, dataTypeMember->memberType);
                         ptrs += sizeof(void*);
                     }
-                    else
-                    {
-                        retval |= UA_print((const void*)ptrs, &UA_TYPES[dataTypeMember->memberTypeIndex], &outString);
-                        if (ancestorsName.empty() || !is_number(std::string((char*)outString.data, outString.length))) {
+                    else {
+                        retval |= UA_print((const void*)ptrs, dataTypeMember->memberType, &outString);
+                        if(dataTypeMember->memberType->typeKind != UA_DATATYPEKIND_ENUM) {
                             out = UA_PrintContext_addOutput(&ctx, outString.length);
                             if (!out)
                                 retval |= UA_STATUSCODE_BADOUTOFMEMORY;
@@ -1654,8 +1585,9 @@ UA_StatusCode UA_PrintStructure(const UA_Variant* data, UA_String* output) {
                         }
                         else {
                             char* pError;
-                            std::string ancestorsNameValue = std::string((char*)outString.data, outString.length);
+                            std::string ancestorsNameValue = std::string((char*)outString.data, outString.length);                            
                             UA_UInt32 i = (UA_UInt32)strtoll(ancestorsNameValue.c_str(), &pError, 10);
+                            typePropIt = dataTypeMap.find(UA_NodeId_hash(&dataTypeMember->memberType->typeId));
                             if (ancestorsNameValue.c_str() != pError && typePropIt != dataTypeMap.end()) {
                                 for (UA_UInt32 j = 0; j < typePropIt->second.enumValueSet.size(); j++) {
                                     if (i == typePropIt->second.enumValueSet.at(j).value) {
@@ -1666,7 +1598,7 @@ UA_StatusCode UA_PrintStructure(const UA_Variant* data, UA_String* output) {
                             }
                         }
                         UA_String_clear(&outString);
-                        ptrs += UA_TYPES[dataTypeMember->memberTypeIndex].memSize;
+                        ptrs += dataTypeMember->memberType->memSize;
                     }
                     if (i < dataType->membersSize - 1u)
                         retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
@@ -1896,10 +1828,7 @@ UA_StatusCode UA_PrintUnion(const UA_Variant* data, UA_String* output) {
                 retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
 #endif
                 retval |= UA_PrintContext_addName(&ctx, "Value");
-                if (unionDataTypeMember->namespaceZero)
-                    retval |= UA_print((void*)ptrs, &UA_TYPES[unionDataTypeMember->memberTypeIndex], &outString);
-                else
-                    retval |= UA_PrintContext_addString(&ctx, "NameSpaceIndex is not 0");
+                UA_print((void*)ptrs, unionDataTypeMember->memberType, &outString);
                 if (retval == UA_STATUSCODE_GOOD) {
                     retval |= UA_PrintContext_addUAString(&ctx, &outString);
                     UA_String_clear(&outString);
@@ -1971,7 +1900,7 @@ UA_StatusCode UA_PrintValue(UA_Client* client, UA_NodeId nodeId, UA_Variant* dat
     if (data->type->typeKind == UA_DATATYPEKIND_STRUCTURE || data->type->typeKind == UA_DATATYPEKIND_OPTSTRUCT)
         UA_PrintStructure(data, output);
     // ENUM
-    else if (data->type->typeIndex == UA_TYPES_INT32 && !data->type->membersSize && !data->arrayLength) {
+    else if (UA_NodeId_equal(&data->type->typeId, &NS0ID_INT32) && !data->type->membersSize && !data->arrayLength) {
         UA_NodeId typeId;
         typePropIt_t typePropIt;
         retval |= UA_Client_readDataTypeAttribute(client, nodeId, &typeId);
@@ -2113,7 +2042,7 @@ UA_StatusCode scan4BaseDataTypes(UA_Client* client) {
                                     if (((UA_ExtensionObject*)outValue.data)[i].encoding == UA_EXTENSIONOBJECT_DECODED) {
                                         const UA_DataType* dataType = ((UA_ExtensionObject*)outValue.data)[i].content.decoded.type;
                                         UA_ExtensionObject* extObj = &((UA_ExtensionObject*)outValue.data)[i];
-                                        if (extObj->encoding == UA_EXTENSIONOBJECT_DECODED && dataType->typeIndex == UA_TYPES_ENUMVALUETYPE) {
+                                        if (extObj->encoding == UA_EXTENSIONOBJECT_DECODED && dataType->typeKind == UA_DATATYPEKIND_STRUCTURE) {// && dataType->typeIndex == UA_TYPES_ENUMVALUETYPE) {
                                             UA_EnumValueType* enumValue = (UA_EnumValueType*)extObj->content.decoded.data;
                                             UA_EnumValueType newEnumValue;
                                             UA_EnumValueType_copy(enumValue, &newEnumValue);
@@ -2136,9 +2065,9 @@ UA_StatusCode scan4BaseDataTypes(UA_Client* client) {
 }
 
 // search data type tree recursively and collect node IDs
-void scanForTypeIds(UA_BrowseResponse* bResp, std::vector<UA_NodeId>* dataTypeIds, std::vector<UA_NodeId>* cutomDataTypeIds) {
+void scanForTypeIds(UA_BrowseResponse* bResp, std::vector<UA_NodeId>* dataTypeIds, std::vector<UA_NodeId>* customDataTypeIds) {
     UA_BrowseResult bRes;
-    if (!bResp || !dataTypeIds || !cutomDataTypeIds)
+    if (!bResp || !dataTypeIds || !customDataTypeIds)
         return;
     for (size_t i = 0; i < bResp->resultsSize; ++i) {
         bRes = bResp->results[i];
@@ -2149,29 +2078,72 @@ void scanForTypeIds(UA_BrowseResponse* bResp, std::vector<UA_NodeId>* dataTypeId
             dataTypeIds->push_back(bRes.references[j].nodeId.nodeId);
             // skip base data types with NameSpaceIndex = 0
             if (bRes.references[j].nodeId.nodeId.namespaceIndex)
-                cutomDataTypeIds->push_back(bRes.references[j].nodeId.nodeId);
+                customDataTypeIds->push_back(bRes.references[j].nodeId.nodeId);
         }
     }
 }
 
+UA_StatusCode scan4Variables(UA_Client* client, UA_NodeId parentNode, std::vector<UA_NodeId>* variableIds) {
+    UA_StatusCode retval;
+    std::vector<UA_NodeId> ids; // nodes to visit
+    std::vector<UA_NodeId> subIds; // children IDs
+    UA_BrowseResponse bResp;
+    UA_BrowseResult bRes;
+
+    if (!client) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "scan4Variables: Client session invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (UA_NodeId_isNull(&parentNode)) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "scan4Variables: Parameter 2 (UA_NodeId) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    if (!variableIds) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "scan4Variables: Parameter 3 (std::vector<UA_NodeId>*) invalid");
+        return UA_STATUSCODE_BADUNEXPECTEDERROR;
+    }
+    retval = UA_STATUSCODE_GOOD;
+    ids.push_back(parentNode);
+    while (!ids.empty()) {
+        for (const UA_NodeId& id : ids) {
+            retval |= browseNodeId(client, id, &bResp);
+            if (retval == UA_STATUSCODE_GOOD) {
+                for (size_t i = 0; i < bResp.resultsSize; ++i) {
+                    bRes = bResp.results[i];
+                    for (size_t j = 0; j < bRes.referencesSize; ++j) {
+                        if (bResp.results[i].references[j].nodeClass == UA_NODECLASS_VARIABLE)
+                            variableIds->push_back(bResp.results[i].references[j].nodeId.nodeId);
+                        else if(bResp.results[i].references[j].isForward && bResp.results[i].references[j].nodeClass == UA_NODECLASS_OBJECT)
+                            subIds.push_back(bResp.results[i].references[j].nodeId.nodeId);
+                    }
+                }
+            }
+        }
+        ids.swap(subIds);
+        subIds.clear();
+    }
+    return retval;
+}
+
 int main(int argc, char* argv[]) {
-    const UA_UInt16 numberOfIds = 11; //3;// 
-    const char id[numberOfIds][255] = { "Demo.Static.Arrays.String", "Demo.Static.Arrays.Int32", "Demo.Static.Scalar.CarExtras", "Demo.BoilerDemo.Boiler1.HeaterStatus", "Demo.Static.Scalar.OptionSet", "Demo.Static.Scalar.XmlElement", "Demo.Static.Scalar.Structure", "Demo.Static.Scalar.Union", "Demo.Static.Scalar.Structures.AnalogMeasurement", "Person1", "Demo.Static.Scalar.OptionalFields" };//{ "ComplexTypes/CustomStructTypeVariable", "ComplexTypes/CustomEnumTypeVariable", "ComplexTypes/CustomUnionTypeVariable" };//
+    const char* parentId = "ns=2;s=Demo.Static";
     const char* uaUrl = "opc.tcp://firing2.exp.bessy.de:48010";//"opc.tcp://milo.digitalpetri.com:62541/milo";//
     UA_Client* client;
     UA_NodeId nodeId;
     UA_StatusCode retval;
     UA_String out;
     UA_Variant outValue;
+    std::vector<UA_NodeId> variableIds;
 
     if (argc > 1) uaUrl = argv[1];
+    if (argc > 2) parentId = argv[2];
 
     // open OPC UA session
     client = UA_Client_new();
     UA_ClientConfig_setDefault(UA_Client_getConfig(client));
     retval = UA_Client_connect(client, uaUrl);
     if (retval != UA_STATUSCODE_GOOD) {
-        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Could not open OPC UA client session. (%s)", UA_StatusCode_name(retval));
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Could not open OPC UA client session to %s. (%s)", uaUrl, UA_StatusCode_name(retval));
         UA_Client_delete(client);
         return EXIT_FAILURE;
     }
@@ -2197,9 +2169,14 @@ int main(int argc, char* argv[]) {
         UA_String_clear(&out);
     }
 
-    for (UA_UInt16 i = 0; i < numberOfIds; i++) {
-        // create and print node ID
-        nodeId = UA_NODEID_STRING_ALLOC(2, id[i]);
+    retval = UA_NodeId_parse(&nodeId, UA_STRING_ALLOC(parentId));
+    scan4Variables(client, UA_NODEID_STRING_ALLOC(2, "Demo.Static"), &variableIds);
+    if (retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, "Could not retrieve variable node IDs from parent ID %s. (%s)", parentId, UA_StatusCode_name(retval));
+    }
+
+    for (UA_NodeId nodeId : variableIds) {
+        // print node ID
         UA_print(&nodeId, &UA_TYPES[UA_TYPES_NODEID], &out);
         printf("%.*s\n", (UA_UInt16)out.length, out.data);
         UA_String_clear(&out);
