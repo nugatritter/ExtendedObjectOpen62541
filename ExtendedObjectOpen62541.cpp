@@ -1179,7 +1179,7 @@ UA_StatusCode UA_PrintDataType(const UA_DataType* dataType, UA_String* output) {
                     retval |= UA_PrintContext_addNewlineTabs(&ctx, ctx.depth);
                     for (UA_UInt32 j = 0; j < typePropIt->second.structureDefinition[i].fieldsSize; j++) {
                         retval |= UA_PrintContext_addString(&ctx, "[0x");
-                        retval |= printUInt32(&ctx, 2 << j, 4, true);
+                        retval |= printUInt32(&ctx, pow(2, j), 4, true);
                         retval |= UA_PrintContext_addString(&ctx, "] ");
                         UA_PrintContext_addUAString(&ctx, &typePropIt->second.structureDefinition[i].fields[j].name);
                         if (j + 1 < (UA_UInt32)typePropIt->second.structureDefinition[i].fieldsSize)
